@@ -1,0 +1,56 @@
+{
+  "name": "@getpipher/vision",
+  "version": "0.1.0",
+  "description": "Capability-aware vision + paste extension for the pi coding agent. Delegates image analysis to a vision model only when the active primary model is text-only; passes images through natively for multimodal models (zero delegation).",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "vision",
+    "multimodal",
+    "image-analysis",
+    "capability-aware"
+  ],
+  "license": "MIT",
+  "author": "RECTOR <rector@rectorspace.com>",
+  "homepage": "https://github.com/getpipher/vision",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/getpipher/vision.git"
+  },
+  "bugs": {
+    "url": "https://github.com/getpipher/vision/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/vision.ts",
+      "./extensions/paste.ts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test",
+    "test:run": "tsx --test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
