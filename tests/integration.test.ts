@@ -168,6 +168,23 @@ function mockFetch(body: unknown, status = 200): FetchMock {
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
+/** Mock fetch that returns a queued sequence of responses (one per call). */
+function mockFetchSeq(responses: Array<{ status: number; body: unknown }>): FetchMock {
+  const calls: FetchMock["calls"] = [];
+  const original = globalThis.fetch;
+  let i = 0;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), body: init?.body ? JSON.parse(init.body as string) : null });
+    const r = responses[Math.min(i, responses.length - 1)]!;
+    i++;
+    return new Response(typeof r.body === "string" ? r.body : JSON.stringify(r.body), {
+      status: r.status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof globalThis.fetch;
+  return { calls, restore: () => { globalThis.fetch = original; } };
+}
+
 async function runVisionCommand(pi: MockPi, args: string, model?: Model<Api>): Promise<void> {
   const cmd = pi.commands.get("vision");
   assert.ok(cmd, "/vision command registered");
@@ -565,7 +582,123 @@ test("panel: live edit via SettingsList onChange applies + persists", async () =
   await pi.commands.get("vision")!.handler("", panelCtx);
   // The live-edit logic itself (applySettingChange + applyAndSave) is covered by
   // the lib/config tests; this test confirms the panel constructs in TUI mode.
-});// Cleanup the temp agent dir after all tests.
+});// ── v0.2.0 (SPEC-2) integration tests ────────────────────────────────────
+
+test("T11: cache hit via tool execute → 2nd call = 0 vision-model calls + details.cached", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  const fm = mockFetch({ choices: [{ message: { content: "a pixel" } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    const ctx = makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) });
+    const r1 = await executeTool(pi, { image_path: file, prompt: "describe", compress: false }, ctx);
+    assert.equal(r1.details.cached, false, "first call is a cache miss");
+    assert.equal(fm.calls.length, 1, "first call fetches");
+    const r2 = await executeTool(pi, { image_path: file, prompt: "describe", compress: false }, ctx);
+    assert.equal(r2.details.cached, true, "second call is a cache hit");
+    assert.equal(fm.calls.length, 1, "T11 GATE: 2nd call = 0 vision-model API calls");
+    assert.match(r2.content[0].text, /a pixel/);
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T16: systemPrompt set → request body has system message first (via tool execute)", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  const fm = mockFetch({ choices: [{ message: { content: "ok" } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    await runVisionCommand(pi, "system-prompt You are a forensic analyst.", TEXT_ONLY);
+    const ctx = makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) });
+    await executeTool(pi, { image_path: file, prompt: "p", compress: false }, ctx);
+    assert.equal(fm.calls.length, 1);
+    assert.equal(fm.calls[0]!.body.messages[0].role, "system");
+    assert.equal(fm.calls[0]!.body.messages[0].content, "You are a forensic analyst.");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T20: primary 4xx (no retry) → fallback fires via tool execute + details.fallback", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  const fm = mockFetchSeq([
+    { status: 400, body: "bad request" },                                   // primary (no retry)
+    { status: 200, body: { choices: [{ message: { content: "fb desc" } }] } }, // fallback
+  ]);
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    await runVisionCommand(pi, "fallback openrouter/qwen3.5:cloud", TEXT_ONLY);
+    const ctx = makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) });
+    const res = await executeTool(pi, { image_path: file, prompt: "p", compress: false }, ctx);
+    assert.equal(res.details.fallback, true, "fallback fired");
+    assert.equal(res.details.model, "openrouter/qwen3.5:cloud");
+    assert.match(res.content[0].text, /fb desc/);
+    assert.equal(fm.calls.length, 2, "1 primary (no retry) + 1 fallback");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T24: alt+shift+v shortcut registered + invokes pickVisionModel → config updated", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
+  const shortcut = pi.shortcuts.get("alt+shift+v");
+  assert.ok(shortcut, "alt+shift+v shortcut registered");
+  let notified = "";
+  const sc = makeCtx({
+    model: TEXT_ONLY,
+    registry: {
+      getAvailable: () => [MULTIMODAL, VISION_MODEL],
+      find: () => VISION_MODEL,
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k", headers: undefined }),
+    } as any,
+  }) as unknown as ExtensionContext;
+  (sc.ui as any).select = async (_t: string, _o: string[]) => "ollama/minimax-m3:cloud";
+  (sc.ui as any).notify = (msg: string) => { notified = msg; };
+  await shortcut!.handler(sc);
+  assert.match(notified, /Vision model set to ollama\//);
+});
+
+test("T25: /vision-use <provider/model> sets directly (no picker)", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
+  let notified = "";
+  const cmd = pi.commands.get("vision-use");
+  assert.ok(cmd, "/vision-use command registered");
+  const c = makeCtx({ model: TEXT_ONLY }) as unknown as ExtensionCommandContext;
+  (c.ui as any).notify = (msg: string) => { notified = msg; };
+  await cmd!.handler("openrouter/qwen3.5:cloud", c);
+  assert.match(notified, /openrouter\/qwen3\.5:cloud/);
+  // Verify via /vision show
+  let shown = "";
+  const sc = makeCtx({ model: TEXT_ONLY }) as unknown as ExtensionCommandContext;
+  (sc.ui as any).notify = (msg: string) => { shown = msg; };
+  await pi.commands.get("vision")!.handler("show", sc);
+  assert.match(shown, /qwen3\.5:cloud/);
+});
+
+// Cleanup the temp agent dir after all tests.
 test("cleanup", () => {
   rmSync(TMP_AGENT, { recursive: true, force: true });
 });
