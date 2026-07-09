@@ -18,6 +18,8 @@ function makeEntry(text: string, model = "ollama/minimax-m3:cloud"): CacheEntry 
       prompt: "describe",
       compressed: true,
       reasoning: "off",
+      cached: false,
+      fallback: false,
     },
     storedAt: Date.now(),
   };
