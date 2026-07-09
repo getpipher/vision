@@ -64,10 +64,12 @@ interface MockPi {
   handlers: Map<string, Array<(event: any, ctx: any) => any>>;
   tools: Map<string, ToolDefinition>;
   commands: Map<string, { handler: (args: string, ctx: any) => Promise<void> }>;
+  shortcuts: Map<string, { description?: string; handler: (ctx: any) => Promise<void> | void }>;
   active: string[];
   on(event: string, handler: any): void;
   registerTool(def: ToolDefinition): void;
   registerCommand(name: string, opts: any): void;
+  registerShortcut(shortcut: string, opts: { description?: string; handler: (ctx: any) => Promise<void> | void }): void;
   getActiveTools(): string[];
   setActiveTools(names: string[]): void;
   emit(event: string, eventObj: any, ctx: any): Promise<any>;
@@ -77,11 +79,13 @@ function createMockPi(initialActive = ["read", "bash", "edit", "write"]): MockPi
   const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
   const tools = new Map<string, ToolDefinition>();
   const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+  const shortcuts = new Map<string, { description?: string; handler: (ctx: any) => Promise<void> | void }>();
   let active = initialActive.slice();
   const pi: MockPi = {
     handlers,
     tools,
     commands,
+    shortcuts,
     active,
     on(event, handler) {
       (handlers.get(event) ?? handlers.set(event, []).get(event)!).push(handler);
@@ -91,6 +95,9 @@ function createMockPi(initialActive = ["read", "bash", "edit", "write"]): MockPi
     },
     registerCommand(name, opts) {
       commands.set(name, opts);
+    },
+    registerShortcut(shortcut, opts) {
+      shortcuts.set(shortcut, opts);
     },
     getActiveTools: () => active.slice(),
     setActiveTools(names) {

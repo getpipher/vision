@@ -19,7 +19,7 @@
  * subcommands (`/vision on`, `/vision model <id>`, …) remain for power users.
  */
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -143,13 +143,14 @@ function applyAndSave(id: string, value: string, pi: ExtensionAPI, ctx: Extensio
 }
 
 /** Vision-capable authed models from the registry (input includes "image"). */
-function visionCapableModels(ctx: ExtensionCommandContext): Model<Api>[] {
+function visionCapableModels(ctx: ExtensionContext): Model<Api>[] {
   return ctx.modelRegistry.getAvailable().filter((m) => m.input.includes("image"));
 }
 
 /** Open pi's native select picker over vision-capable models. Sets provider +
- *  model together. Used by `/vision model` (no arg) as a quick pick. */
-async function pickVisionModel(ctx: ExtensionCommandContext): Promise<boolean> {
+ *  model together. Used by `/vision model` (no arg), `/vision-use`, and the
+ *  `alt+shift+v` hotkey as a quick pick. */
+async function pickVisionModel(ctx: ExtensionContext): Promise<boolean> {
   const models = visionCapableModels(ctx);
   if (models.length === 0) {
     ctx.ui.notify(
@@ -600,6 +601,39 @@ export default function visionExtension(pi: ExtensionAPI): void {
           );
         }
       }
+    },
+  });
+
+  // ── /vision-use command + alt+shift+v hotkey (SPEC-2 gap #5: inline switch) ─
+  // Both switch the DELEGATE vision model mid-session without the full panel.
+  // Tool visibility is unaffected (it tracks the PRIMARY model's capability,
+  // not the vision model) so no resync is needed.
+  pi.registerCommand("vision-use", {
+    description:
+      "Switch the DELEGATE vision model inline. No arg → picker; <provider/model> → set directly. (Hotkey: alt+shift+v)",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (!value) {
+        const picked = await pickVisionModel(ctx);
+        if (picked) ctx.ui.notify(`Vision model set to ${config.provider}/${config.model}.`, "info");
+        return;
+      }
+      const slash = value.indexOf("/");
+      if (slash > 0 && slash < value.length - 1) {
+        config = { ...config, provider: value.slice(0, slash), model: value.slice(slash + 1) };
+      } else {
+        config = { ...config, model: value };
+      }
+      saveConfig(config, getAgentDir());
+      ctx.ui.notify(`Vision model set to ${config.provider}/${config.model}.`, "info");
+    },
+  });
+
+  pi.registerShortcut("alt+shift+v", {
+    description: "Switch vision model (inline picker)",
+    handler: async (ctx) => {
+      const picked = await pickVisionModel(ctx);
+      if (picked) ctx.ui.notify(`Vision model set to ${config.provider}/${config.model}.`, "info");
     },
   });
 }
