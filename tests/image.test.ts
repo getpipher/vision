@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectMimeType, loadImage, MAX_IMAGE_BYTES } from "../lib/image.ts";
+import { detectMimeType, hashBytes, loadImage, MAX_IMAGE_BYTES } from "../lib/image.ts";
 
 // 1×1 transparent PNG — decodes to bytes starting with the PNG signature
 // (89 50 4E 47 0D 0A 1A 0A).
@@ -153,8 +153,61 @@ test("loadImage: compress=true returns ok (compressed or gracefully degraded)", 
     if (r.ok) {
       assert.ok(r.image.data.length > 0);
       assert.ok(r.image.mimeType.startsWith("image/"));
+      assert.equal(r.sourceHash.length, 64, "sourceHash is sha256 hex (64 chars)");
+      assert.match(r.sourceHash, /^[0-9a-f]{64}$/, "sourceHash is lowercase hex");
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("loadImage: sourceHash is stable across two loads of the same file", async () => {
+  const dir = tmpDir();
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const a = await loadImage(file, { ...LOAD_OPTS, cwd: dir });
+    const b = await loadImage(file, { ...LOAD_OPTS, cwd: dir });
+    assert.equal(a.ok, true);
+    assert.equal(b.ok, true);
+    if (a.ok && b.ok) assert.equal(a.sourceHash, b.sourceHash, "same bytes → same hash");
+    if (a.ok) assert.equal(a.sourceHash, hashBytes(PNG_BYTES), "matches direct hashBytes");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadImage: different bytes → different sourceHash", async () => {
+  const dir = tmpDir();
+  try {
+    writeFileSync(join(dir, "a.png"), PNG_BYTES);
+    const otherBytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBApDk1+wAAAAASUVORK5CYII=",
+      "base64",
+    );
+    writeFileSync(join(dir, "b.png"), otherBytes);
+    const a = await loadImage(join(dir, "a.png"), { ...LOAD_OPTS, cwd: dir });
+    const b = await loadImage(join(dir, "b.png"), { ...LOAD_OPTS, cwd: dir });
+    assert.equal(a.ok, true);
+    assert.equal(b.ok, true);
+    if (a.ok && b.ok) assert.notEqual(a.sourceHash, b.sourceHash, "different bytes → different hash");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadImage: data URL + raw base64 both return sourceHash", async () => {
+  const viaUrl = await loadImage(`data:image/png;base64,${PNG_1x1_B64}`, LOAD_OPTS);
+  const viaRaw = await loadImage(PNG_1x1_B64, LOAD_OPTS);
+  assert.equal(viaUrl.ok, true);
+  assert.equal(viaRaw.ok, true);
+  if (viaUrl.ok) assert.equal(viaUrl.sourceHash, hashBytes(PNG_BYTES), "data URL hash matches bytes");
+  if (viaRaw.ok) assert.equal(viaRaw.sourceHash, hashBytes(PNG_BYTES), "raw base64 hash matches bytes");
+  if (viaUrl.ok && viaRaw.ok)
+    assert.equal(viaUrl.sourceHash, viaRaw.sourceHash, "same bytes via different input shapes → same hash");
+});
+
+test("hashBytes: empty + known vector", () => {
+  assert.equal(hashBytes(Buffer.alloc(0)), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  assert.equal(hashBytes(PNG_BYTES).length, 64);
 });

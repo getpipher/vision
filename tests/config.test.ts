@@ -26,6 +26,14 @@ test("DEFAULT_CONFIG has the expected shape", () => {
     jpegQuality: 85,
     defaultReasoningEffort: "off",
     enabled: true,
+    systemPrompt: undefined,
+    cacheEnabled: true,
+    cachePersist: false,
+    cacheMaxEntries: 256,
+    retryAttempts: 2,
+    retryBackoffMs: 500,
+    fallbackProvider: undefined,
+    fallbackModel: undefined,
   });
 });
 
@@ -203,4 +211,108 @@ test("applySettingChange: reasoning sets valid level, rejects invalid", () => {
 
 test("applySettingChange: unknown id → unchanged", () => {
   assert.deepEqual(applySettingChange(DEFAULT_CONFIG, "nope", "x"), DEFAULT_CONFIG);
+});
+
+// ── v0.2.0 fields (SPEC-2) ──────────────────────────────────────────────────
+
+test("mergeConfig: v0.1.0-shape config (6 fields) loads with v0.2.0 defaults (forward-compat)", () => {
+  const c = mergeConfig({
+    provider: "ollama",
+    model: "minimax-m3:cloud",
+    maxDimension: 1568,
+    jpegQuality: 85,
+    defaultReasoningEffort: "off",
+    enabled: true,
+  });
+  assert.equal(c.systemPrompt, undefined);
+  assert.equal(c.cacheEnabled, true);
+  assert.equal(c.cachePersist, false);
+  assert.equal(c.cacheMaxEntries, 256);
+  assert.equal(c.retryAttempts, 2);
+  assert.equal(c.retryBackoffMs, 500);
+  assert.equal(c.fallbackProvider, undefined);
+  assert.equal(c.fallbackModel, undefined);
+});
+
+test("mergeConfig: v0.2.0 fields pass through + validate", () => {
+  const c = mergeConfig({
+    systemPrompt: "  You are an analyst.  ",
+    cacheEnabled: false,
+    cachePersist: true,
+    cacheMaxEntries: 512,
+    retryAttempts: 5,
+    retryBackoffMs: 1000,
+    fallbackProvider: "openrouter",
+    fallbackModel: "qwen3.5:cloud",
+  });
+  assert.equal(c.systemPrompt, "You are an analyst.", "trimmed");
+  assert.equal(c.cacheEnabled, false);
+  assert.equal(c.cachePersist, true);
+  assert.equal(c.cacheMaxEntries, 512);
+  assert.equal(c.retryAttempts, 5);
+  assert.equal(c.retryBackoffMs, 1000);
+  assert.equal(c.fallbackProvider, "openrouter");
+  assert.equal(c.fallbackModel, "qwen3.5:cloud");
+});
+
+test("mergeConfig: empty systemPrompt → undefined", () => {
+  assert.equal(mergeConfig({ systemPrompt: "   " }).systemPrompt, undefined);
+  assert.equal(mergeConfig({ systemPrompt: "" }).systemPrompt, undefined);
+});
+
+test("mergeConfig: clamps cacheMaxEntries to [1, 10000]", () => {
+  assert.equal(mergeConfig({ cacheMaxEntries: 0 }).cacheMaxEntries, 1);
+  assert.equal(mergeConfig({ cacheMaxEntries: 999999 }).cacheMaxEntries, 10000);
+  assert.equal(mergeConfig({ cacheMaxEntries: "128" }).cacheMaxEntries, 128);
+  assert.equal(mergeConfig({ cacheMaxEntries: "x" }).cacheMaxEntries, 256);
+});
+
+test("mergeConfig: clamps retryAttempts to [0, 10] + retryBackoffMs to [0, 60000]", () => {
+  assert.equal(mergeConfig({ retryAttempts: -1 }).retryAttempts, 0);
+  assert.equal(mergeConfig({ retryAttempts: 99 }).retryAttempts, 10);
+  assert.equal(mergeConfig({ retryBackoffMs: -5 }).retryBackoffMs, 0);
+  assert.equal(mergeConfig({ retryBackoffMs: 999999 }).retryBackoffMs, 60000);
+});
+
+test("mergeConfig: non-boolean cache flags → defaults", () => {
+  assert.equal(mergeConfig({ cacheEnabled: "yes" }).cacheEnabled, true);
+  assert.equal(mergeConfig({ cachePersist: 1 }).cachePersist, false);
+  assert.equal(mergeConfig({ cacheEnabled: false }).cacheEnabled, false);
+});
+
+test("applySettingChange: systemPrompt set / clear", () => {
+  const set = applySettingChange(DEFAULT_CONFIG, "systemPrompt", "You are a forensic analyst.");
+  assert.equal(set.systemPrompt, "You are a forensic analyst.");
+  const cleared = applySettingChange(set, "systemPrompt", "");
+  assert.equal(cleared.systemPrompt, undefined, "empty string clears");
+  const trimmed = applySettingChange(DEFAULT_CONFIG, "systemPrompt", "  hi  ");
+  assert.equal(trimmed.systemPrompt, "hi");
+});
+
+test("applySettingChange: cacheEnabled / cachePersist on/off", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "cacheEnabled", "off").cacheEnabled, false);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "cacheEnabled", "on").cacheEnabled, true);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "cachePersist", "on").cachePersist, true);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "cachePersist", "off").cachePersist, false);
+});
+
+test("applySettingChange: cacheMaxEntries / retryAttempts / retryBackoffMs parse + clamp", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "cacheMaxEntries", "512").cacheMaxEntries, 512);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "cacheMaxEntries", "99999").cacheMaxEntries, 10000);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "retryAttempts", "5").retryAttempts, 5);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "retryAttempts", "99").retryAttempts, 10);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "retryBackoffMs", "1000").retryBackoffMs, 1000);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "retryBackoffMs", "notanum").retryBackoffMs, DEFAULT_CONFIG.retryBackoffMs);
+});
+
+test("applySettingChange: fallbackModel provider/id splits both; bare id keeps fallbackProvider", () => {
+  const r = applySettingChange(DEFAULT_CONFIG, "fallbackModel", "openrouter/qwen3.5:cloud");
+  assert.equal(r.fallbackProvider, "openrouter");
+  assert.equal(r.fallbackModel, "qwen3.5:cloud");
+  const base = { ...DEFAULT_CONFIG, fallbackProvider: "openrouter", fallbackModel: "old" };
+  const bare = applySettingChange(base, "fallbackModel", "new-fb");
+  assert.equal(bare.fallbackProvider, "openrouter");
+  assert.equal(bare.fallbackModel, "new-fb");
+  const cleared = applySettingChange(base, "fallbackModel", "");
+  assert.equal(cleared.fallbackModel, undefined);
 });

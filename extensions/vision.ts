@@ -19,13 +19,15 @@
  * subcommands (`/vision on`, `/vision model <id>`, …) remain for power users.
  */
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   Container,
   type Component,
+  Input,
   SettingsList,
   type SettingItem,
   SelectItem,
@@ -43,9 +45,19 @@ import {
   type VisionConfig,
 } from "../lib/config.ts";
 import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
+import { VisionCache } from "../lib/cache.ts";
 
 /** Current config. Loaded on session_start, mutated by /vision, saved to disk. */
 let config: VisionConfig = { ...DEFAULT_CONFIG };
+
+/** Content-addressed delegation cache. Rebuilt on session_start + when
+ *  cachePersist/cacheMaxEntries change. Memory-only when cachePersist is off. */
+let cache: VisionCache = new VisionCache(undefined, DEFAULT_CONFIG.cacheMaxEntries);
+
+function rebuildCache(): void {
+  const dir = config.cachePersist ? join(getAgentDir(), "vision-cache") : undefined;
+  cache = new VisionCache(dir, config.cacheMaxEntries);
+}
 
 const SUBCOMMANDS = [
   "show",
@@ -56,6 +68,9 @@ const SUBCOMMANDS = [
   "max-dim",
   "quality",
   "reasoning-effort",
+  "system-prompt",
+  "cache",
+  "fallback",
   "clear",
 ] as const;
 
@@ -68,7 +83,17 @@ function formatConfigStatus(c: VisionConfig): string {
     `  maxDimension:    ${c.maxDimension}px`,
     `  jpegQuality:     ${c.jpegQuality}`,
     `  reasoning:       ${c.defaultReasoningEffort}`,
+    `  systemPrompt:    ${c.systemPrompt ? truncatePreview(c.systemPrompt, 40) : "(none)"}`,
+    `  cache:           ${c.cacheEnabled ? "on" : "off"}${c.cachePersist ? " (persisted, max " + c.cacheMaxEntries + ")" : ""}`,
+    `  retry:           ${c.retryAttempts} attempts, ${c.retryBackoffMs}ms backoff`,
+    `  fallback:        ${c.fallbackProvider && c.fallbackModel ? c.fallbackProvider + "/" + c.fallbackModel : "(none)"}`,
   ].join("\n");
+}
+
+/** Truncate a string for a settings-row preview, appending an ellipsis if it overflows. */
+function truncatePreview(s: string, max: number): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
 }
 
 /** Display string for a setting row, from the current config. */
@@ -84,6 +109,20 @@ function renderValue(id: string): string {
       return `${config.jpegQuality}`;
     case "reasoning":
       return config.defaultReasoningEffort;
+    case "systemPrompt":
+      return config.systemPrompt ? truncatePreview(config.systemPrompt, 40) : "(none)";
+    case "cacheEnabled":
+      return config.cacheEnabled ? "on" : "off";
+    case "cachePersist":
+      return config.cachePersist ? "on" : "off";
+    case "cacheMaxEntries":
+      return `${config.cacheMaxEntries}`;
+    case "retryAttempts":
+      return `${config.retryAttempts}`;
+    case "retryBackoffMs":
+      return `${config.retryBackoffMs}ms`;
+    case "fallbackModel":
+      return config.fallbackProvider && config.fallbackModel ? `${config.fallbackProvider}/${config.fallbackModel}` : "(none)";
     default:
       return "";
   }
@@ -94,21 +133,24 @@ function resync(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   syncToolAvailability(pi, ctx.model, { enabled: config.enabled });
 }
 
-/** Apply a setting edit, persist, and re-sync visibility if needed. */
+/** Apply a setting edit, persist, re-sync visibility if needed, and rebuild
+ *  the cache when cache-shape fields change. */
 function applyAndSave(id: string, value: string, pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   config = applySettingChange(config, id, value);
   saveConfig(config, getAgentDir());
   if (id === "enabled" || id === "model") resync(pi, ctx);
+  if (id === "cachePersist" || id === "cacheMaxEntries") rebuildCache();
 }
 
 /** Vision-capable authed models from the registry (input includes "image"). */
-function visionCapableModels(ctx: ExtensionCommandContext): Model<Api>[] {
+function visionCapableModels(ctx: ExtensionContext): Model<Api>[] {
   return ctx.modelRegistry.getAvailable().filter((m) => m.input.includes("image"));
 }
 
 /** Open pi's native select picker over vision-capable models. Sets provider +
- *  model together. Used by `/vision model` (no arg) as a quick pick. */
-async function pickVisionModel(ctx: ExtensionCommandContext): Promise<boolean> {
+ *  model together. Used by `/vision model` (no arg), `/vision-use`, and the
+ *  `alt+shift+v` hotkey as a quick pick. */
+async function pickVisionModel(ctx: ExtensionContext): Promise<boolean> {
   const models = visionCapableModels(ctx);
   if (models.length === 0) {
     ctx.ui.notify(
@@ -176,11 +218,61 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
         values: [...REASONING_LEVELS],
         description: "Default reasoning effort for delegation calls.",
       },
+      // ── v0.2.0 (SPEC-2) rows ────────────────────────────────────────────
+      {
+        id: "systemPrompt",
+        label: "System prompt",
+        currentValue: renderValue("systemPrompt"),
+        description: "Vision-model framing prepended to the request. Enter to edit inline (single-line). For multi-line, use /vision system-prompt.",
+        submenu: (cur, subDone) => buildSystemPromptInput(cur, subDone),
+      },
+      {
+        id: "cacheEnabled",
+        label: "Caching",
+        currentValue: renderValue("cacheEnabled"),
+        values: ["on", "off"],
+        description: "When on, identical delegation calls return a cached description (0 tokens on hit).",
+      },
+      {
+        id: "cachePersist",
+        label: "Persist cache to disk",
+        currentValue: renderValue("cachePersist"),
+        values: ["on", "off"],
+        description: "When on, the cache survives session restarts (LRU-evicted at max entries).",
+      },
+      {
+        id: "cacheMaxEntries",
+        label: "Cache max entries",
+        currentValue: renderValue("cacheMaxEntries"),
+        values: ["64", "128", "256", "512", "1024"],
+        description: "Max disk-cache entries before LRU eviction.",
+      },
+      {
+        id: "retryAttempts",
+        label: "Retry attempts",
+        currentValue: renderValue("retryAttempts"),
+        values: ["0", "1", "2", "3", "5"],
+        description: "Retries after the first failure (total attempts = this + 1). Only 5xx/429/network retry.",
+      },
+      {
+        id: "retryBackoffMs",
+        label: "Retry backoff (ms)",
+        currentValue: renderValue("retryBackoffMs"),
+        values: ["250", "500", "1000", "2000"],
+        description: "Base backoff; delay = min(backoffMs * 2^attempt, 8000ms).",
+      },
+      {
+        id: "fallbackModel",
+        label: "Fallback vision model",
+        currentValue: renderValue("fallbackModel"),
+        description: "Secondary vision model tried when the primary exhausts retries or fails non-retryable. Enter opens a picker.",
+        submenu: (_cur, subDone) => buildModelSubmenu(theme, ctx, subDone),
+      },
     ];
 
     const settingsList = new SettingsList(
       items,
-      8,
+      12,
       {
         label: (text, selected) => (selected ? theme.fg("accent", theme.bold(text)) : text),
         value: (text, selected) => (selected ? theme.fg("accent", text) : theme.fg("muted", text)),
@@ -237,10 +329,25 @@ function buildModelSubmenu(
   return sl;
 }
 
+/** Build the single-line system-prompt editor shown when Enter is pressed on
+ *  the system-prompt row. An `Input` (the same component SettingsList uses
+ *  for its own search box). Empty submit clears; Escape cancels. */
+function buildSystemPromptInput(
+  currentValue: string,
+  subDone: (selectedValue?: string) => void,
+): Component {
+  const input = new Input();
+  input.setValue(currentValue === "(none)" ? "" : currentValue);
+  input.onSubmit = (value) => subDone(value); // "" commits → applySettingChange clears
+  input.onEscape = () => subDone(); // undefined → cancel (no change)
+  return input;
+}
+
 export default function visionExtension(pi: ExtensionAPI): void {
   // ── Session lifecycle ───────────────────────────────────────────────────
   pi.on("session_start", (_event, ctx) => {
     config = loadConfig(getAgentDir());
+    rebuildCache();
     syncToolAvailability(pi, ctx.model, { enabled: config.enabled });
   });
 
@@ -310,7 +417,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
         reasoning: (params.reasoning ?? config.defaultReasoningEffort) as ReasoningLevel,
       };
 
-      const result = await delegateToVisionModel(ctx, config, delegateParams, signal);
+      const result = await delegateToVisionModel(ctx, config, delegateParams, signal, cache);
       if (result.ok) {
         return {
           content: [{ type: "text" as const, text: result.text }],
@@ -328,7 +435,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
   // ── /vision slash command ──────────────────────────────────────────────
   pi.registerCommand("vision", {
     description:
-      "Open the vision settings panel (like /settings). Subcommands: show, on, off, provider <p>, model [<id>], max-dim <px>, quality <1-100>, reasoning-effort <level>, clear.",
+      "Open the vision settings panel (like /settings). Subcommands: show, on, off, provider <p>, model [<id>], max-dim <px>, quality <1-100>, reasoning-effort <level>, system-prompt [<text>|clear], cache <clear|show>, fallback [<provider/model>|clear>, clear.",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = parts[0] ?? ""; // empty → open the settings panel
@@ -426,8 +533,65 @@ export default function visionExtension(pi: ExtensionAPI): void {
         case "clear": {
           config = { ...DEFAULT_CONFIG };
           saveConfig(config, agentDir);
+          rebuildCache();
           resync(pi, ctx);
           ctx.ui.notify("Vision config reset to defaults.", "info");
+          return;
+        }
+        case "system-prompt": {
+          const value = parts.slice(1).join(" ").trim();
+          if (!value) {
+            // No arg → multi-line editor (safe: command handler, not inside ctx.ui.custom).
+            if (ctx.hasUI) {
+              const edited = await ctx.ui.editor("Vision system prompt", config.systemPrompt ?? "");
+              if (edited === undefined) return; // cancelled
+              config = { ...config, systemPrompt: edited.trim().length > 0 ? edited.trim() : undefined };
+            } else {
+              ctx.ui.notify("Usage: /vision system-prompt <text> (or /vision system-prompt clear)", "warning");
+              return;
+            }
+          } else if (value === "clear") {
+            config = { ...config, systemPrompt: undefined };
+          } else {
+            config = { ...config, systemPrompt: value };
+          }
+          saveConfig(config, agentDir);
+          ctx.ui.notify(config.systemPrompt ? "Vision system prompt set." : "Vision system prompt cleared.", "info");
+          return;
+        }
+        case "cache": {
+          const action = parts[1];
+          if (action === "clear") {
+            cache.clear();
+            ctx.ui.notify("Vision cache cleared (memory + disk).", "info");
+          } else if (action === "show") {
+            const s = cache.stats();
+            ctx.ui.notify(`Vision cache: ${s.memoryEntries} memory, ${s.diskEntries} disk (max ${s.maxEntries}, persisted ${s.persisted}).`, "info");
+          } else {
+            ctx.ui.notify("Usage: /vision cache <clear|show>", "warning");
+          }
+          return;
+        }
+        case "fallback": {
+          const value = parts.slice(1).join(" ").trim();
+          if (!value) {
+            ctx.ui.notify("Usage: /vision fallback <provider/model> (or /vision fallback clear)", "warning");
+            return;
+          }
+          if (value === "clear") {
+            config = { ...config, fallbackProvider: undefined, fallbackModel: undefined };
+            saveConfig(config, agentDir);
+            ctx.ui.notify("Fallback vision model cleared.", "info");
+            return;
+          }
+          const slash = value.indexOf("/");
+          if (slash > 0 && slash < value.length - 1) {
+            config = { ...config, fallbackProvider: value.slice(0, slash), fallbackModel: value.slice(slash + 1) };
+          } else {
+            config = { ...config, fallbackModel: value };
+          }
+          saveConfig(config, agentDir);
+          ctx.ui.notify(`Fallback vision model set to ${config.fallbackProvider}/${config.fallbackModel}.`, "info");
           return;
         }
         default: {
@@ -437,6 +601,39 @@ export default function visionExtension(pi: ExtensionAPI): void {
           );
         }
       }
+    },
+  });
+
+  // ── /vision-use command + alt+shift+v hotkey (SPEC-2 gap #5: inline switch) ─
+  // Both switch the DELEGATE vision model mid-session without the full panel.
+  // Tool visibility is unaffected (it tracks the PRIMARY model's capability,
+  // not the vision model) so no resync is needed.
+  pi.registerCommand("vision-use", {
+    description:
+      "Switch the DELEGATE vision model inline. No arg → picker; <provider/model> → set directly. (Hotkey: alt+shift+v)",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (!value) {
+        const picked = await pickVisionModel(ctx);
+        if (picked) ctx.ui.notify(`Vision model set to ${config.provider}/${config.model}.`, "info");
+        return;
+      }
+      const slash = value.indexOf("/");
+      if (slash > 0 && slash < value.length - 1) {
+        config = { ...config, provider: value.slice(0, slash), model: value.slice(slash + 1) };
+      } else {
+        config = { ...config, model: value };
+      }
+      saveConfig(config, getAgentDir());
+      ctx.ui.notify(`Vision model set to ${config.provider}/${config.model}.`, "info");
+    },
+  });
+
+  pi.registerShortcut("alt+shift+v", {
+    description: "Switch vision model (inline picker)",
+    handler: async (ctx) => {
+      const picked = await pickVisionModel(ctx);
+      if (picked) ctx.ui.notify(`Vision model set to ${config.provider}/${config.model}.`, "info");
     },
   });
 }

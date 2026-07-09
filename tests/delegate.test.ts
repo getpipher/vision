@@ -10,6 +10,7 @@ import {
   delegateToVisionModel,
 } from "../lib/delegate.ts";
 import { DEFAULT_CONFIG } from "../lib/config.ts";
+import { VisionCache } from "../lib/cache.ts";
 
 const PNG_1x1_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M8AAAMBEg1+mP0AAAAASUVORK5CYII=";
@@ -61,6 +62,26 @@ function mockFetchError(status: number, body: string): {
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     calls.push({ url: String(url), init: init ?? {} });
     return new Response(body, { status });
+  }) as typeof globalThis.fetch;
+  return { calls, restore: () => { globalThis.fetch = original; } };
+}
+
+/** Mock fetch that returns a queued sequence of responses (one per call). */
+function mockFetchSeq(responses: { status: number; body: unknown }[]): {
+  calls: FetchCall[];
+  restore: () => void;
+} {
+  const calls: FetchCall[] = [];
+  const original = globalThis.fetch;
+  let i = 0;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init ?? {} });
+    const r = responses[Math.min(i, responses.length - 1)]!;
+    i++;
+    return new Response(JSON.stringify(r.body), {
+      status: r.status,
+      headers: { "Content-Type": "application/json" },
+    });
   }) as typeof globalThis.fetch;
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
@@ -321,6 +342,277 @@ test("delegateToVisionModel: success → returns text + details", async () => {
       assert.equal(r.details.image_path, file);
       assert.equal(r.details.compressed, false);
     }
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── v0.2.0 (SPEC-2) tests ───────────────────────────────────────────────
+
+test("delegateToVisionModel: success details include cached=false + fallback=false (v0.1.0 path)", async () => {
+  const dir = tmpDir();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud" };
+    const r = await delegateToVisionModel(ctx, cfg, {
+      image_path: file, prompt: "describe", compress: false, reasoning: "off",
+    }, undefined);
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.details.cached, false);
+      assert.equal(r.details.fallback, false);
+    }
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: cache hit = 0 vision-model calls (2nd call)", async () => {
+  const dir = tmpDir();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "a desc" } }] } });
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", cacheEnabled: true };
+    const cache = new VisionCache(undefined, 256);
+    const params = { image_path: file, prompt: "describe", compress: false, reasoning: "off" as const };
+
+    const r1 = await delegateToVisionModel(ctx, cfg, params, undefined, cache);
+    assert.equal(r1.ok, true);
+    if (r1.ok) assert.equal(r1.details.cached, false);
+    assert.equal(m.calls.length, 1, "first call fetches");
+
+    const r2 = await delegateToVisionModel(ctx, cfg, params, undefined, cache);
+    assert.equal(r2.ok, true);
+    if (r2.ok) {
+      assert.equal(r2.details.cached, true, "second call is a cache hit");
+      assert.equal(r2.text, "a desc");
+    }
+    assert.equal(m.calls.length, 1, "second call = 0 vision-model calls");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: cache miss when prompt changes", async () => {
+  const dir = tmpDir();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "d" } }] } });
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", cacheEnabled: true };
+    const cache = new VisionCache(undefined, 256);
+    await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "describe", compress: false, reasoning: "off" }, undefined, cache);
+    await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "different", compress: false, reasoning: "off" }, undefined, cache);
+    assert.equal(m.calls.length, 2, "different prompt → miss → fetches again");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: systemPrompt set → request body has system message first", async () => {
+  const dir = tmpDir();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", systemPrompt: "You are a forensic analyst." };
+    await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    const body = JSON.parse(m.calls[0]!.init.body as string);
+    assert.equal(body.messages[0].role, "system");
+    assert.equal(body.messages[0].content, "You are a forensic analyst.");
+    assert.equal(body.messages[1].role, "user");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: no systemPrompt → v0.1.0 shape (user first)", async () => {
+  const dir = tmpDir();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud" };
+    await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    const body = JSON.parse(m.calls[0]!.init.body as string);
+    assert.equal(body.messages[0].role, "user", "no system message when systemPrompt unset");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: retry on 500 then success (retryAttempts=2 → 3 calls)", async () => {
+  const dir = tmpDir();
+  const m = mockFetchSeq([
+    { status: 500, body: { error: "boom" } },
+    { status: 500, body: { error: "boom" } },
+    { status: 200, body: { choices: [{ message: { content: "recovered" } }] } },
+  ]);
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", retryAttempts: 2, retryBackoffMs: 1 };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.text, "recovered");
+      assert.equal(r.details.fallback, false);
+      assert.equal(r.details.cached, false);
+    }
+    assert.equal(m.calls.length, 3, "3 total attempts on primary");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: 4xx (client) → no retry → fallback fires", async () => {
+  const dir = tmpDir();
+  const m = mockFetchSeq([
+    { status: 400, body: "bad request" },        // primary (no retry)
+    { status: 200, body: { choices: [{ message: { content: "fb-desc" } }] } }, // fallback
+  ]);
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = {
+      ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud",
+      retryAttempts: 3, retryBackoffMs: 1,
+      fallbackProvider: "openrouter", fallbackModel: "qwen3.5:cloud",
+    };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.details.fallback, true);
+      assert.equal(r.details.model, "openrouter/qwen3.5:cloud");
+      assert.equal(r.text, "fb-desc");
+    }
+    assert.equal(m.calls.length, 2, "1 primary (no retry) + 1 fallback");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: 5xx exhausts retries → fallback fires", async () => {
+  const dir = tmpDir();
+  const m = mockFetchSeq([
+    { status: 500, body: "boom" },
+    { status: 500, body: "boom" },
+    { status: 500, body: "boom" },              // primary exhausts (attempts=2 → 3 calls)
+    { status: 200, body: { choices: [{ message: { content: "fb" } }] } }, // fallback
+  ]);
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = {
+      ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud",
+      retryAttempts: 2, retryBackoffMs: 1,
+      fallbackProvider: "openrouter", fallbackModel: "qwen3.5:cloud",
+    };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal(r.details.fallback, true);
+    assert.equal(m.calls.length, 4, "3 primary + 1 fallback");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: no fallback configured + primary exhausts → primary error", async () => {
+  const dir = tmpDir();
+  const m = mockFetchSeq([
+    { status: 500, body: "boom" },
+    { status: 500, body: "boom" },
+    { status: 500, body: "boom" },
+  ]);
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", retryAttempts: 2, retryBackoffMs: 1 };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, false);
+    if (!r.ok) {
+      assert.equal(r.error.code, "vision_call_error");
+      assert.match(r.error.message, /500/);
+      assert.equal(r.details, undefined, "no fallback attempted → no primaryError details");
+    }
+    assert.equal(m.calls.length, 3);
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: fallback also fails → error + primaryError + fallbackModel", async () => {
+  const dir = tmpDir();
+  const m = mockFetchSeq([
+    { status: 500, body: "primary boom" },
+    { status: 500, body: "primary boom" },
+    { status: 500, body: "primary boom" },
+    { status: 500, body: "fallback boom" },   // fallback also fails
+  ]);
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const cfg = {
+      ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud",
+      retryAttempts: 2, retryBackoffMs: 1,
+      fallbackProvider: "openrouter", fallbackModel: "qwen3.5:cloud",
+    };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, false);
+    if (!r.ok) {
+      assert.equal(r.error.code, "vision_call_error");
+      assert.match(r.error.message, /fallback/);
+      assert.equal(r.details?.fallbackModel, "openrouter/qwen3.5:cloud");
+      assert.ok(r.details?.primaryError, "primaryError set for traceability");
+    }
+    assert.equal(m.calls.length, 4);
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: abort → code 'aborted', 0 calls, no fallback", async () => {
+  const dir = tmpDir();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "ok" } }] } });
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({ cwd: dir });
+    const ac = new AbortController();
+    ac.abort();
+    const cfg = {
+      ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud",
+      retryAttempts: 3, retryBackoffMs: 1,
+      fallbackProvider: "openrouter", fallbackModel: "qwen3.5:cloud",
+    };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, ac.signal);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.equal(r.error.code, "aborted");
+    assert.equal(m.calls.length, 0, "abort before first attempt → 0 calls + no fallback");
   } finally {
     m.restore();
     rmSync(dir, { recursive: true, force: true });

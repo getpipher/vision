@@ -76,10 +76,34 @@ model should have `"input": ["text", "image"]`. Other `/vision` subcommands:
 | `/vision max-dim <px>` | Max image dimension for compression (1–8000) |
 | `/vision quality <1-100>` | JPEG re-encode quality |
 | `/vision reasoning-effort <off\|minimal\|low\|medium\|high\|xhigh>` | Default reasoning effort for delegation |
+| `/vision system-prompt [<text>\|clear]` | Set/clear a custom system prompt for the vision model (no arg → multi-line editor) |
+| `/vision cache <clear\|show>` | Clear the cache or show stats (memory + disk entries) |
+| `/vision fallback <provider/model>\|clear` | Set/clear a fallback vision model |
 | `/vision clear` | Reset config to defaults |
+| `/vision-use [provider/model]` | Switch the DELEGATE vision model inline (no arg → picker). **Hotkey: `alt+shift+v`** (rebindable via `keybindings.json`) |
 
 Config is stored at `~/.pi/agent/vision.json` (not `vision-tool.json`, so it
 doesn't collide with the community package during transition).
+
+## Resilience (v0.2.0)
+
+DELEGATE mode (text-only primary) is resilient + cheap:
+
+- **Caching.** Successful delegation results are cached by a content-addressed
+  key (image hash + compression params + prompt + vision model + reasoning).
+  A second call on the same image costs **zero** vision-model API calls.
+  In-memory by default; opt into cross-session persistence with **Persist
+  cache to disk** (LRU-evicted at the configured max entries). Only successes
+  are cached — failures never are. `/vision cache clear` wipes both layers.
+- **Retry + fallback.** On a retryable failure (HTTP 5xx, 429, network), the
+  primary vision model is retried with exponential backoff (abort-aware — a
+  cancelled turn stops retrying immediately). On a non-retryable error or
+  exhausted retries, a configured **fallback vision model** is tried once.
+  Configure both via the `/vision` panel or `/vision fallback <provider/model>`.
+- **Custom system prompt.** A per-workflow framing prepended to the
+  vision-model request (`/vision system-prompt <text>`, or the panel row).
+- **Inline model switch.** `alt+shift+v` (or `/vision-use`) switches the
+  DELEGATE vision model mid-session without opening the full panel.
 
 ## How it works
 
@@ -117,6 +141,10 @@ Parameters:
 | `prompt` | string | What to analyze or answer about the image |
 | `compress` | boolean? | Optimize the image before delegation (default `true`) |
 | `reasoning` | enum? | Reasoning effort for the delegation (`off`…`xhigh`) |
+
+When caching or fallback is active, the tool result `details` include
+`cached: true` (cache hit) and `fallback: true` (result from the fallback
+model) for traceability.
 
 For multimodal primaries you don't call `describe_image` — just reference the
 image path in your message and the model sees it natively.

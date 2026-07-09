@@ -39,6 +39,23 @@ export interface VisionConfig {
   defaultReasoningEffort: ReasoningLevel;
   /** Master switch. When false, describe_image is hidden + errors if invoked. */
   enabled: boolean;
+  // ── v0.2.0 (SPEC-2) ──────────────────────────────────────────────────────
+  /** Custom system prompt prepended to the vision-model request (undefined = none, v0.1.0 shape). */
+  systemPrompt: string | undefined;
+  /** When true, successful delegation results are cached (0 tokens on hit). */
+  cacheEnabled: boolean;
+  /** When true, the cache also persists to disk (cross-session hits, LRU-evicted). */
+  cachePersist: boolean;
+  /** Max entries in the disk cache before LRU eviction. */
+  cacheMaxEntries: number;
+  /** Number of retries after the first failure (total attempts = retryAttempts + 1). */
+  retryAttempts: number;
+  /** Base backoff in ms for retry; delay = min(retryBackoffMs * 2^attempt, 8000). */
+  retryBackoffMs: number;
+  /** Fallback vision model provider (used when the primary exhausts retries / fails non-retryable). */
+  fallbackProvider: string | undefined;
+  /** Fallback vision model id under fallbackProvider. */
+  fallbackModel: string | undefined;
 }
 
 export const DEFAULT_CONFIG: VisionConfig = {
@@ -48,6 +65,15 @@ export const DEFAULT_CONFIG: VisionConfig = {
   jpegQuality: 85,
   defaultReasoningEffort: "off",
   enabled: true,
+  // v0.2.0 defaults
+  systemPrompt: undefined,
+  cacheEnabled: true,
+  cachePersist: false,
+  cacheMaxEntries: 256,
+  retryAttempts: 2,
+  retryBackoffMs: 500,
+  fallbackProvider: undefined,
+  fallbackModel: undefined,
 };
 
 export const CONFIG_FILENAME = "vision.json";
@@ -67,6 +93,11 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
   return Math.min(max, Math.max(min, Math.round(n)));
 }
 
+/** Non-empty trimmed string → string; empty/missing → undefined. */
+function strOrUndef(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
 /**
  * Merge a parsed partial config over the defaults, validating + clamping
  * every field so a malformed file can never produce an invalid `VisionConfig`.
@@ -74,14 +105,23 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
 export function mergeConfig(partial: unknown): VisionConfig {
   const p = (partial ?? {}) as Partial<Record<string, unknown>>;
   return {
-    provider: typeof p.provider === "string" && p.provider.trim().length > 0 ? p.provider.trim() : undefined,
-    model: typeof p.model === "string" && p.model.trim().length > 0 ? p.model.trim() : undefined,
+    provider: strOrUndef(p.provider),
+    model: strOrUndef(p.model),
     maxDimension: clampInt(p.maxDimension, 1, 8000, DEFAULT_CONFIG.maxDimension),
     jpegQuality: clampInt(p.jpegQuality, 1, 100, DEFAULT_CONFIG.jpegQuality),
     defaultReasoningEffort: isReasoningLevel(p.defaultReasoningEffort)
       ? p.defaultReasoningEffort
       : DEFAULT_CONFIG.defaultReasoningEffort,
     enabled: typeof p.enabled === "boolean" ? p.enabled : DEFAULT_CONFIG.enabled,
+    // v0.2.0 fields
+    systemPrompt: strOrUndef(p.systemPrompt),
+    cacheEnabled: typeof p.cacheEnabled === "boolean" ? p.cacheEnabled : DEFAULT_CONFIG.cacheEnabled,
+    cachePersist: typeof p.cachePersist === "boolean" ? p.cachePersist : DEFAULT_CONFIG.cachePersist,
+    cacheMaxEntries: clampInt(p.cacheMaxEntries, 1, 10000, DEFAULT_CONFIG.cacheMaxEntries),
+    retryAttempts: clampInt(p.retryAttempts, 0, 10, DEFAULT_CONFIG.retryAttempts),
+    retryBackoffMs: clampInt(p.retryBackoffMs, 0, 60000, DEFAULT_CONFIG.retryBackoffMs),
+    fallbackProvider: strOrUndef(p.fallbackProvider),
+    fallbackModel: strOrUndef(p.fallbackModel),
   };
 }
 
@@ -150,6 +190,37 @@ export function applySettingChange(
     case "reasoning":
       if (isReasoningLevel(value)) return { ...config, defaultReasoningEffort: value };
       return config;
+    // ── v0.2.0 fields ──────────────────────────────────────────────────────
+    case "systemPrompt":
+      // Empty string (panel Input cleared) → undefined; otherwise the typed text.
+      return { ...config, systemPrompt: value.trim().length > 0 ? value.trim() : undefined };
+    case "cacheEnabled":
+      return { ...config, cacheEnabled: value === "on" };
+    case "cachePersist":
+      return { ...config, cachePersist: value === "on" };
+    case "cacheMaxEntries": {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, cacheMaxEntries: Math.min(10000, Math.max(1, n)) };
+    }
+    case "retryAttempts": {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, retryAttempts: Math.min(10, Math.max(0, n)) };
+    }
+    case "retryBackoffMs": {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, retryBackoffMs: Math.min(60000, Math.max(0, n)) };
+    }
+    case "fallbackModel": {
+      // "provider/id" → set both; bare id → set fallbackModel only (keeps fallbackProvider)
+      const slash = value.indexOf("/");
+      if (slash > 0 && slash < value.length - 1) {
+        return { ...config, fallbackProvider: value.slice(0, slash), fallbackModel: value.slice(slash + 1) };
+      }
+      return { ...config, fallbackModel: value.length > 0 ? value : undefined };
+    }
     default:
       return config;
   }
