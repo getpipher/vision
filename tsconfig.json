@@ -15,6 +15,6 @@
     "noUncheckedIndexedAccess": true,
     "types": []
   },
-  "include": ["extensions/**/*.ts", "lib/**/*.ts"],
+  "include": ["extensions/**/*.ts", "lib/**/*.ts", "tests/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

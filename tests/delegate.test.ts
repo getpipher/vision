@@ -8,8 +8,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   callVisionModel,
   delegateToVisionModel,
-} from "./delegate.ts";
-import { DEFAULT_CONFIG } from "./config.ts";
+} from "../lib/delegate.ts";
+import { DEFAULT_CONFIG } from "../lib/config.ts";
 
 const PNG_1x1_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M8AAAMBEg1+mP0AAAAASUVORK5CYII=";

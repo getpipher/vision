@@ -1,0 +1,60 @@
+name: Release
+
+# Publishes @getpipher/vision to npm on tag push (v*).
+# Uses the getpipher org secret NPM_TOKEN (granular npm token, Read-and-write,
+# scoped to @getpipher, with "Bypass 2FA" — no OTP needed). Inherited by all
+# getpipher repos.  gh secret set NPM_TOKEN --org getpipher
+#
+# Idempotent: skips if the version is already on npm (safe to re-run).
+# Gates on typecheck + tests before publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm typecheck
+
+      - run: pnpm test:run
+
+      - name: Skip if already published
+        id: check
+        run: |
+          set -u
+          ver=$(node -p "require('./package.json').version")
+          pkg=$(node -p "require('./package.json').name")
+          existing=$(npm view "$pkg@$ver" version 2>/dev/null || true)
+          if [ "$existing" = "$ver" ]; then
+            echo "::notice::$pkg@$ver already on npm — skipping publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Publishing $pkg@$ver"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.check.outputs.skip != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

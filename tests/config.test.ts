@@ -12,7 +12,7 @@ import {
   mergeConfig,
   saveConfig,
   applySettingChange,
-} from "./config.ts";
+} from "../lib/config.ts";
 
 function tmpAgentDir(): string {
   return mkdtempSync(join(tmpdir(), "vision-cfg-"));

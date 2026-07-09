@@ -6,7 +6,7 @@ import {
   syncToolAvailability,
   TOOL_NAME,
   type ToolAvailabilityController,
-} from "./capability.ts";
+} from "../lib/capability.ts";
 
 function makeModel(input: ("text" | "image")[]): Model<Api> {
   return {

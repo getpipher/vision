@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectMimeType, loadImage, MAX_IMAGE_BYTES } from "./image.ts";
+import { detectMimeType, loadImage, MAX_IMAGE_BYTES } from "../lib/image.ts";
 
 // 1×1 transparent PNG — decodes to bytes starting with the PNG signature
 // (89 50 4E 47 0D 0A 1A 0A).

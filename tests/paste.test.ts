@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findImagePathTokens } from "./paste.ts";
+import { findImagePathTokens } from "../extensions/paste.ts";
 
 test("findImagePathTokens: absolute path", () => {
   assert.deepEqual(findImagePathTokens("analyze /tmp/screenshot.png"), ["/tmp/screenshot.png"]);
