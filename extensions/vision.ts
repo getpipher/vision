@@ -10,6 +10,11 @@
  *   guarantees path-referenced images reach the model.
  * - Text-only primary → `describe_image` visible (DELEGATE to the configured
  *   vision model via `lib/delegate.ts`).
+ *
+ * `/vision model` with no argument opens pi's native picker
+ * (`ctx.ui.select`) listing vision-capable authed models from the registry —
+ * same UX quality as `/model`, scoped to vision-model selection. The typed
+ * form (`/vision model <id>`) remains as a power-user fallback.
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -56,6 +61,32 @@ function formatConfigStatus(c: VisionConfig): string {
 /** Re-sync tool visibility after a config change that could affect it. */
 function resync(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   syncToolAvailability(pi, ctx.model, { enabled: config.enabled });
+}
+
+/** Open pi's native picker over vision-capable authed models. Sets provider +
+ *  model together. No-op (returns false) if the user cancels or there are no
+ *  candidates. */
+async function pickVisionModel(ctx: ExtensionCommandContext): Promise<boolean> {
+  const models = ctx.modelRegistry.getAvailable().filter((m) => m.input.includes("image"));
+  if (models.length === 0) {
+    ctx.ui.notify(
+      'No vision-capable models found. Define a model with `input: ["text","image"]` in ~/.pi/agent/models.json and configure its auth.',
+      "warning",
+    );
+    return false;
+  }
+  const options = models.map((m) => `${m.provider}/${m.id}`);
+  const choice = await ctx.ui.select("Pick a vision model:", options);
+  if (!choice) return false; // user cancelled (or non-UI mode)
+  const slash = choice.indexOf("/");
+  if (slash <= 0 || slash >= choice.length - 1) return false;
+  config = {
+    ...config,
+    provider: choice.slice(0, slash),
+    model: choice.slice(slash + 1),
+  };
+  saveConfig(config, getAgentDir());
+  return true;
 }
 
 export default function visionExtension(pi: ExtensionAPI): void {
@@ -149,7 +180,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
   // ── /vision slash command ──────────────────────────────────────────────
   pi.registerCommand("vision", {
     description:
-      "Configure the vision tool: show, on, off, provider <p>, model <m>, max-dim <px>, quality <1-100>, reasoning-effort <level>, clear.",
+      "Configure the vision tool. `/vision model` (no arg) opens a picker of vision-capable models. Other: show, on, off, provider <p>, model <id>, max-dim <px>, quality <1-100>, reasoning-effort <level>, clear.",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = parts[0] ?? "show";
@@ -189,7 +220,13 @@ export default function visionExtension(pi: ExtensionAPI): void {
         case "model": {
           const value = parts.slice(1).join(" ").trim();
           if (!value) {
-            ctx.ui.notify("Usage: /vision model <id>", "warning");
+            // Interactive picker: list vision-capable authed models, set both
+            // provider + model together.
+            const picked = await pickVisionModel(ctx);
+            if (picked) {
+              resync(pi, ctx);
+              ctx.ui.notify(`Vision model set to ${config.provider}/${config.model}.`, "info");
+            }
             return;
           }
           config = { ...config, model: value };

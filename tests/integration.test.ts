@@ -396,6 +396,87 @@ test("bonus: /vision show + config persistence across a fresh load", async () =>
   assert.match(notified, /reasoning.*high/);
 });
 
+// ── Picker: /vision model (no arg) opens native select over vision-capable models ──
+test("picker: /vision model with no arg opens select + sets provider+model together", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
+  // Build a ctx whose ui.select returns a specific model choice + a registry that lists models
+  let selectedTitle = "";
+  let selectedOptions: string[] = [];
+  const pickerCtx = makeCtx({
+    model: TEXT_ONLY,
+    registry: {
+      getAvailable: () => [MULTIMODAL, VISION_MODEL, TEXT_ONLY],
+      find: () => VISION_MODEL,
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k", headers: undefined }),
+    } as any,
+  }) as unknown as ExtensionCommandContext;
+  (pickerCtx.ui as any).select = async (title: string, options: string[]) => {
+    selectedTitle = title;
+    selectedOptions = options;
+    return "ollama/minimax-m3:cloud"; // user picks this
+  };
+  let notified = "";
+  (pickerCtx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.commands.get("vision")!.handler("model", pickerCtx);
+  assert.match(selectedTitle, /Pick a vision model/);
+  // Only vision-capable (input includes image) models listed: MULTIMODAL + VISION_MODEL
+  assert.ok(selectedOptions.includes("ollama/minimax-m3:cloud"));
+  assert.ok(!selectedOptions.includes("ollama/glm-5.2:cloud"), "text-only model excluded from picker");
+  assert.match(notified, /Vision model set to ollama\/minimax-m3:cloud/);
+  // Verify it persisted: a subsequent /vision show reflects it
+  let shown = "";
+  const showCtx = makeCtx({ model: TEXT_ONLY }) as unknown as ExtensionCommandContext;
+  (showCtx.ui as any).notify = (msg: string) => { shown = msg; };
+  await pi.commands.get("vision")!.handler("show", showCtx);
+  assert.match(shown, /minimax-m3:cloud/);
+});
+
+test("picker: no vision-capable models → actionable warning", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
+  let notified = "";
+  let selectCalled = false;
+  const pickerCtx = makeCtx({
+    model: TEXT_ONLY,
+    registry: {
+      getAvailable: () => [TEXT_ONLY], // only a text-only model
+      find: () => undefined,
+      getApiKeyAndHeaders: async () => ({ ok: false, error: "x" }),
+    } as any,
+  }) as unknown as ExtensionCommandContext;
+  (pickerCtx.ui as any).select = async () => { selectCalled = true; return undefined; };
+  (pickerCtx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.commands.get("vision")!.handler("model", pickerCtx);
+  assert.equal(selectCalled, false, "picker must not open when no vision-capable models");
+  assert.match(notified, /No vision-capable models found/);
+});
+
+test("picker: user cancels (select returns undefined) → no config change", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
+  await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+  await runVisionCommand(pi, "model original-model", TEXT_ONLY);
+  const pickerCtx = makeCtx({
+    model: TEXT_ONLY,
+    registry: { getAvailable: () => [MULTIMODAL], find: () => VISION_MODEL, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k", headers: undefined }) } as any,
+  }) as unknown as ExtensionCommandContext;
+  (pickerCtx.ui as any).select = async () => undefined; // cancel
+  (pickerCtx.ui as any).notify = () => {};
+  await pi.commands.get("vision")!.handler("model", pickerCtx);
+  // config.model unchanged
+  let shown = "";
+  const showCtx = makeCtx({ model: TEXT_ONLY }) as unknown as ExtensionCommandContext;
+  (showCtx.ui as any).notify = (msg: string) => { shown = msg; };
+  await pi.commands.get("vision")!.handler("show", showCtx);
+  assert.match(shown, /original-model/, "model unchanged after cancel");
+});
 // Cleanup the temp agent dir after all tests.
 test("cleanup", () => {
   rmSync(TMP_AGENT, { recursive: true, force: true });

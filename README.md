@@ -48,6 +48,13 @@ The vision tool needs a configured vision model for DELEGATE mode (text-only
 primaries). Set it once via `/vision`:
 
 ```
+/vision model
+```
+
+This opens pi's native picker of your vision-capable authed models (from
+`models.json`). Or set explicitly:
+
+```
 /vision provider ollama
 /vision model minimax-m3:cloud
 ```
@@ -60,7 +67,8 @@ model should have `"input": ["text", "image"]`. Other `/vision` subcommands:
 | `/vision` or `/vision show` | Display the current config |
 | `/vision on` / `/vision off` | Enable / disable the tool |
 | `/vision provider <name>` | Set the vision provider |
-| `/vision model <id>` | Set the vision model id |
+| `/vision model` (no arg) | Open a picker of vision-capable authed models |
+| `/vision model <id>` | Set the vision model id (typed fallback) |
 | `/vision max-dim <px>` | Max image dimension for compression (1–8000) |
 | `/vision quality <1-100>` | JPEG re-encode quality |
 | `/vision reasoning-effort <off\|minimal\|low\|medium\|high\|xhigh>` | Default reasoning effort for delegation |
