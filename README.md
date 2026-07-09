@@ -45,14 +45,16 @@ pi uninstall npm:pi-paster
 ## Configure
 
 The vision tool needs a configured vision model for DELEGATE mode (text-only
-primaries). Set it once via `/vision`:
+primaries). Run `/vision` to open an interactive settings panel (pi's native
+`SettingsList` — the same engine `/settings` uses): arrow keys navigate,
+Enter cycles a value or opens the vision-model picker, Escape exits. Changes
+apply live.
 
 ```
-/vision model
+/vision
 ```
 
-This opens pi's native picker of your vision-capable authed models (from
-`models.json`). Or set explicitly:
+Or use the typed subcommands (power users / scripts):
 
 ```
 /vision provider ollama
@@ -64,7 +66,9 @@ model should have `"input": ["text", "image"]`. Other `/vision` subcommands:
 
 | Subcommand | Purpose |
 |---|---|
-| `/vision` or `/vision show` | Display the current config |
+| `/vision` (no arg) | Open the interactive settings panel (like `/settings`) |
+| `/vision show` | Display the current config as text |
+| `/vision model` (no arg) | Open a picker of vision-capable authed models |
 | `/vision on` / `/vision off` | Enable / disable the tool |
 | `/vision provider <name>` | Set the vision provider |
 | `/vision model` (no arg) | Open a picker of vision-capable authed models |

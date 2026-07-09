@@ -11,17 +11,30 @@
  * - Text-only primary → `describe_image` visible (DELEGATE to the configured
  *   vision model via `lib/delegate.ts`).
  *
- * `/vision model` with no argument opens pi's native picker
- * (`ctx.ui.select`) listing vision-capable authed models from the registry —
- * same UX quality as `/model`, scoped to vision-model selection. The typed
- * form (`/vision model <id>`) remains as a power-user fallback.
+ * `/vision` (no arg) opens an interactive settings panel built on pi-tui's
+ * `SettingsList` — the same engine pi's native `/settings` uses. Arrow keys
+ * navigate, Enter cycles a value or opens a sub-picker (e.g. the vision-model
+ * picker), Escape exits. Changes apply live (saved to vision.json + tool
+ * visibility re-synced). Non-TUI modes fall back to a text status. Typed
+ * subcommands (`/vision on`, `/vision model <id>`, …) remain for power users.
  */
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
+import {
+  Container,
+  type Component,
+  SettingsList,
+  type SettingItem,
+  SelectItem,
+  SelectList,
+  Text,
+} from "@earendil-works/pi-tui";
 import { isMultimodal, syncToolAvailability, TOOL_NAME } from "../lib/capability.ts";
 import {
+  applySettingChange,
   DEFAULT_CONFIG,
   loadConfig,
   REASONING_LEVELS,
@@ -58,16 +71,45 @@ function formatConfigStatus(c: VisionConfig): string {
   ].join("\n");
 }
 
+/** Display string for a setting row, from the current config. */
+function renderValue(id: string): string {
+  switch (id) {
+    case "enabled":
+      return config.enabled ? "on" : "off";
+    case "model":
+      return config.provider && config.model ? `${config.provider}/${config.model}` : "(not set)";
+    case "maxDimension":
+      return `${config.maxDimension}px`;
+    case "jpegQuality":
+      return `${config.jpegQuality}`;
+    case "reasoning":
+      return config.defaultReasoningEffort;
+    default:
+      return "";
+  }
+}
+
 /** Re-sync tool visibility after a config change that could affect it. */
 function resync(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   syncToolAvailability(pi, ctx.model, { enabled: config.enabled });
 }
 
-/** Open pi's native picker over vision-capable authed models. Sets provider +
- *  model together. No-op (returns false) if the user cancels or there are no
- *  candidates. */
+/** Apply a setting edit, persist, and re-sync visibility if needed. */
+function applyAndSave(id: string, value: string, pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
+  config = applySettingChange(config, id, value);
+  saveConfig(config, getAgentDir());
+  if (id === "enabled" || id === "model") resync(pi, ctx);
+}
+
+/** Vision-capable authed models from the registry (input includes "image"). */
+function visionCapableModels(ctx: ExtensionCommandContext): Model<Api>[] {
+  return ctx.modelRegistry.getAvailable().filter((m) => m.input.includes("image"));
+}
+
+/** Open pi's native select picker over vision-capable models. Sets provider +
+ *  model together. Used by `/vision model` (no arg) as a quick pick. */
 async function pickVisionModel(ctx: ExtensionCommandContext): Promise<boolean> {
-  const models = ctx.modelRegistry.getAvailable().filter((m) => m.input.includes("image"));
+  const models = visionCapableModels(ctx);
   if (models.length === 0) {
     ctx.ui.notify(
       'No vision-capable models found. Define a model with `input: ["text","image"]` in ~/.pi/agent/models.json and configure its auth.',
@@ -77,16 +119,122 @@ async function pickVisionModel(ctx: ExtensionCommandContext): Promise<boolean> {
   }
   const options = models.map((m) => `${m.provider}/${m.id}`);
   const choice = await ctx.ui.select("Pick a vision model:", options);
-  if (!choice) return false; // user cancelled (or non-UI mode)
+  if (!choice) return false;
   const slash = choice.indexOf("/");
   if (slash <= 0 || slash >= choice.length - 1) return false;
-  config = {
-    ...config,
-    provider: choice.slice(0, slash),
-    model: choice.slice(slash + 1),
-  };
+  config = { ...config, provider: choice.slice(0, slash), model: choice.slice(slash + 1) };
   saveConfig(config, getAgentDir());
   return true;
+}
+
+/**
+ * Open the interactive `/vision` settings panel (pi-tui SettingsList — the
+ * same engine `/settings` uses). TUI-only; non-TUI modes fall back to text.
+ */
+async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify(formatConfigStatus(config), "info");
+    return;
+  }
+  await ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
+    const container = new Container();
+    container.addChild(new Text(theme.fg("accent", theme.bold("Vision tool settings")), 0, 0));
+
+    const items: SettingItem[] = [
+      {
+        id: "enabled",
+        label: "Enabled",
+        currentValue: renderValue("enabled"),
+        values: ["on", "off"],
+        description: "Master switch. Off → describe_image hidden + actionable error if invoked.",
+      },
+      {
+        id: "model",
+        label: "Vision model",
+        currentValue: renderValue("model"),
+        description: "Model to delegate to (DELEGATE mode). Must have input: [text, image]. Enter opens a picker.",
+        submenu: (_cur, subDone) => buildModelSubmenu(theme, ctx, subDone),
+      },
+      {
+        id: "maxDimension",
+        label: "Max dimension",
+        currentValue: renderValue("maxDimension"),
+        values: ["512px", "1024px", "1568px", "2048px", "4096px"],
+        description: "Max long-edge pixels for compression.",
+      },
+      {
+        id: "jpegQuality",
+        label: "JPEG quality",
+        currentValue: renderValue("jpegQuality"),
+        values: ["70", "80", "85", "90", "95"],
+        description: "Re-encode quality (1-100).",
+      },
+      {
+        id: "reasoning",
+        label: "Reasoning effort",
+        currentValue: renderValue("reasoning"),
+        values: [...REASONING_LEVELS],
+        description: "Default reasoning effort for delegation calls.",
+      },
+    ];
+
+    const settingsList = new SettingsList(
+      items,
+      8,
+      {
+        label: (text, selected) => (selected ? theme.fg("accent", theme.bold(text)) : text),
+        value: (text, selected) => (selected ? theme.fg("accent", text) : theme.fg("muted", text)),
+        description: (text) => theme.fg("dim", text),
+        cursor: "❯",
+        hint: (text) => theme.fg("dim", text),
+      },
+      (id, newValue) => {
+        applyAndSave(id, newValue, pi, ctx);
+        settingsList.updateValue(id, renderValue(id));
+      },
+      () => done(true),
+    );
+
+    container.addChild(settingsList);
+    container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter edit/cycle • esc done"), 0, 0));
+
+    return {
+      render(width: number) {
+        return container.render(width);
+      },
+      invalidate() {
+        container.invalidate();
+      },
+      handleInput(data: string) {
+        settingsList.handleInput(data);
+        tui.requestRender();
+      },
+    } as Component & { dispose?(): void };
+  });
+}
+
+/** Build the vision-model sub-picker shown when Enter is pressed on the model
+ *  row of the settings panel. A SelectList over vision-capable authed models. */
+function buildModelSubmenu(
+  theme: Theme,
+  ctx: ExtensionCommandContext,
+  subDone: (selectedValue?: string) => void,
+): Component {
+  const models = visionCapableModels(ctx);
+  const items: SelectItem[] =
+    models.length > 0
+      ? models.map((m) => ({ value: `${m.provider}/${m.id}`, label: `${m.provider}/${m.id}` }))
+      : [{ value: "", label: "(no vision-capable models — add one to models.json)" }];
+  const sl = new SelectList(items, 10, {
+    selectedPrefix: (text) => theme.fg("accent", text),
+    selectedText: (text) => theme.fg("accent", text),
+    description: (text) => theme.fg("muted", text),
+    scrollInfo: (text) => theme.fg("dim", text),
+    noMatch: (text) => theme.fg("warning", text),
+  });
+  sl.onSelect = (item) => subDone(item.value || undefined);
+  sl.onCancel = () => subDone();
+  return sl;
 }
 
 export default function visionExtension(pi: ExtensionAPI): void {
@@ -180,13 +328,18 @@ export default function visionExtension(pi: ExtensionAPI): void {
   // ── /vision slash command ──────────────────────────────────────────────
   pi.registerCommand("vision", {
     description:
-      "Configure the vision tool. `/vision model` (no arg) opens a picker of vision-capable models. Other: show, on, off, provider <p>, model <id>, max-dim <px>, quality <1-100>, reasoning-effort <level>, clear.",
+      "Open the vision settings panel (like /settings). Subcommands: show, on, off, provider <p>, model [<id>], max-dim <px>, quality <1-100>, reasoning-effort <level>, clear.",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
-      const sub = parts[0] ?? "show";
+      const sub = parts[0] ?? ""; // empty → open the settings panel
       const agentDir = getAgentDir();
 
       switch (sub) {
+        case "": {
+          // /vision (no arg) → interactive settings panel (TUI) or text status.
+          await showVisionSettings(pi, ctx);
+          return;
+        }
         case "show": {
           ctx.ui.notify(formatConfigStatus(config), "info");
           return;
@@ -220,8 +373,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
         case "model": {
           const value = parts.slice(1).join(" ").trim();
           if (!value) {
-            // Interactive picker: list vision-capable authed models, set both
-            // provider + model together.
+            // Quick pick via native select dialog (works in RPC too).
             const picked = await pickVisionModel(ctx);
             if (picked) {
               resync(pi, ctx);
@@ -280,7 +432,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
         }
         default: {
           ctx.ui.notify(
-            `Unknown /vision subcommand: ${sub}\nAvailable: ${SUBCOMMANDS.join(", ")}`,
+            `Unknown /vision subcommand: ${sub}\nAvailable: ${SUBCOMMANDS.join(", ")} (or just /vision for the panel)`,
             "warning",
           );
         }

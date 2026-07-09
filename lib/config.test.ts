@@ -11,6 +11,7 @@ import {
   loadConfig,
   mergeConfig,
   saveConfig,
+  applySettingChange,
 } from "./config.ts";
 
 function tmpAgentDir(): string {
@@ -161,4 +162,45 @@ test("isConfiguredForDelegation", () => {
     isConfiguredForDelegation({ ...DEFAULT_CONFIG, provider: "ollama", model: "x" }),
     true,
   );
+});
+
+test("applySettingChange: enabled on/off", () => {
+  const base = { ...DEFAULT_CONFIG, enabled: true };
+  assert.equal(applySettingChange(base, "enabled", "off").enabled, false);
+  assert.equal(applySettingChange(base, "enabled", "on").enabled, true);
+  assert.equal(applySettingChange(base, "enabled", "garbage").enabled, false);
+});
+
+test("applySettingChange: model provider/id splits both", () => {
+  const r = applySettingChange(DEFAULT_CONFIG, "model", "ollama/minimax-m3:cloud");
+  assert.equal(r.provider, "ollama");
+  assert.equal(r.model, "minimax-m3:cloud");
+});
+
+test("applySettingChange: model bare id keeps provider", () => {
+  const base = { ...DEFAULT_CONFIG, provider: "ollama", model: "old" };
+  const r = applySettingChange(base, "model", "new-model");
+  assert.equal(r.provider, "ollama");
+  assert.equal(r.model, "new-model");
+});
+
+test("applySettingChange: maxDimension parses + clamps", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "maxDimension", "2048px").maxDimension, 2048);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "maxDimension", "99999").maxDimension, 8000);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "maxDimension", "0").maxDimension, 1);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "maxDimension", "notanum").maxDimension, DEFAULT_CONFIG.maxDimension);
+});
+
+test("applySettingChange: jpegQuality parses + clamps", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "jpegQuality", "90").jpegQuality, 90);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "jpegQuality", "150").jpegQuality, 100);
+});
+
+test("applySettingChange: reasoning sets valid level, rejects invalid", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "reasoning", "high").defaultReasoningEffort, "high");
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "reasoning", "bogus").defaultReasoningEffort, "off");
+});
+
+test("applySettingChange: unknown id → unchanged", () => {
+  assert.deepEqual(applySettingChange(DEFAULT_CONFIG, "nope", "x"), DEFAULT_CONFIG);
 });

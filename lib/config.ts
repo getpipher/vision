@@ -113,3 +113,44 @@ export function saveConfig(config: VisionConfig, agentDir: string): void {
 export function isConfiguredForDelegation(config: VisionConfig): boolean {
   return !!config.provider && !!config.model;
 }
+
+/**
+ * Apply a single settings-panel edit to a config, returning a NEW config
+ * (pure — no I/O). Used by the /vision interactive settings panel; the
+ * caller handles save + tool-visibility resync. Values are the display
+ * strings the SettingsList cycles/submits (e.g. "on"/"off", "1568px", "85",
+ * "ollama/minimax-m3:cloud", a reasoning level).
+ */
+export function applySettingChange(
+  config: VisionConfig,
+  id: string,
+  value: string,
+): VisionConfig {
+  switch (id) {
+    case "enabled":
+      return { ...config, enabled: value === "on" };
+    case "model": {
+      // "provider/id" → set both; bare id → set model only (keeps provider)
+      const slash = value.indexOf("/");
+      if (slash > 0 && slash < value.length - 1) {
+        return { ...config, provider: value.slice(0, slash), model: value.slice(slash + 1) };
+      }
+      return { ...config, model: value.length > 0 ? value : undefined };
+    }
+    case "maxDimension": {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, maxDimension: Math.min(8000, Math.max(1, n)) };
+    }
+    case "jpegQuality": {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, jpegQuality: Math.min(100, Math.max(1, n)) };
+    }
+    case "reasoning":
+      if (isReasoningLevel(value)) return { ...config, defaultReasoningEffort: value };
+      return config;
+    default:
+      return config;
+  }
+}
