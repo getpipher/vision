@@ -10,6 +10,7 @@
 import { readFile, stat } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve as resolvePath } from "node:path";
+import { createHash } from "node:crypto";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 
 /** Cap on source file size (64 MB) — reject up front so we never base64-encode
@@ -40,8 +41,15 @@ export interface ImageLoadError {
 }
 
 export type ImageLoadResult =
-  | { ok: true; image: LoadedImage }
+  | { ok: true; image: LoadedImage; sourceHash: string }
   | { ok: false; error: ImageLoadError };
+
+/** SHA-256 (hex) of the original image bytes — the content-addressed cache
+ *  key base. Computed from the bytes BEFORE compression so the key is stable
+ *  regardless of compression nondeterminism (worker vs in-process fallback). */
+export function hashBytes(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
 
 export interface LoadOptions {
   /** Run compression (resize + re-encode) on the loaded image. */
@@ -98,7 +106,7 @@ function parseDataUrl(input: string): ImageLoadResult {
   if (!mime) {
     return { ok: false, error: { code: "unsupported_format", message: "could not determine image format from data URL" } };
   }
-  return { ok: true, image: { data: payload, mimeType: mime } };
+  return { ok: true, image: { data: payload, mimeType: mime }, sourceHash: hashBytes(bytes) };
 }
 
 /** Is `input` plausibly a file path we should try to read (vs raw base64)? */
@@ -124,7 +132,7 @@ function decodeBase64(input: string): ImageLoadResult {
   if (!mime) {
     return { ok: false, error: { code: "unsupported_format", message: "could not determine image format from base64 bytes" } };
   }
-  return { ok: true, image: { data: bytes.toString("base64"), mimeType: mime } };
+  return { ok: true, image: { data: bytes.toString("base64"), mimeType: mime }, sourceHash: hashBytes(bytes) };
 }
 
 /**
@@ -136,7 +144,7 @@ export async function loadImage(input: string, options: LoadOptions): Promise<Im
   if (input.startsWith("data:")) {
     const parsed = parseDataUrl(input);
     if (!parsed.ok) return parsed;
-    return compressIfRequested(parsed.image, options);
+    return compressIfRequested(parsed.image, parsed.sourceHash, options);
   }
 
   if (looksLikeFilePath(input)) {
@@ -145,7 +153,7 @@ export async function loadImage(input: string, options: LoadOptions): Promise<Im
       // A path-looking string that doesn't exist might still be raw base64
       // (rare). Fall through to base64 decode rather than hard-failing.
       const fallback = decodeBase64(input);
-      if (fallback.ok) return compressIfRequested(fallback.image, options);
+      if (fallback.ok) return compressIfRequested(fallback.image, fallback.sourceHash, options);
       return { ok: false, error: { code: "not_found", path: input } };
     }
     let st;
@@ -170,20 +178,22 @@ export async function loadImage(input: string, options: LoadOptions): Promise<Im
     if (!mime) {
       return { ok: false, error: { code: "unsupported_format", path: input } };
     }
-    return compressIfRequested({ data: bytes.toString("base64"), mimeType: mime }, options);
+    const sourceHash = hashBytes(bytes);
+    return compressIfRequested({ data: bytes.toString("base64"), mimeType: mime }, sourceHash, options);
   }
 
   // Not a path, not a data URL → treat as raw base64.
   const decoded = decodeBase64(input);
   if (!decoded.ok) return decoded;
-  return compressIfRequested(decoded.image, options);
+  return compressIfRequested(decoded.image, decoded.sourceHash, options);
 }
 
 async function compressIfRequested(
   image: LoadedImage,
+  sourceHash: string,
   options: LoadOptions,
 ): Promise<ImageLoadResult> {
-  if (!options.compress) return { ok: true, image };
+  if (!options.compress) return { ok: true, image, sourceHash };
   try {
     const inputBytes = Buffer.from(image.data, "base64");
     const resized = await resizeImage(inputBytes, image.mimeType, {
@@ -192,12 +202,12 @@ async function compressIfRequested(
       jpegQuality: options.jpegQuality,
     });
     if (resized) {
-      return { ok: true, image: { data: resized.data, mimeType: resized.mimeType } };
+      return { ok: true, image: { data: resized.data, mimeType: resized.mimeType }, sourceHash };
     }
   } catch {
     // resizeImage threw (e.g. Photon unavailable) → degrade to original.
   }
-  return { ok: true, image };
+  return { ok: true, image, sourceHash };
 }
 
 function errorMessage(err: unknown): string {
