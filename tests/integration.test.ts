@@ -656,13 +656,13 @@ test("T20: primary 4xx (no retry) → fallback fires via tool execute + details.
   }
 });
 
-test("T24: alt+shift+v shortcut registered + invokes pickVisionModel → config updated", async () => {
+test("T24: ctrl+shift+i shortcut registered + invokes pickVisionModel → config updated", async () => {
   const pi = createMockPi();
   visionFactory(pi as unknown as ExtensionAPI);
   pasteFactory(pi as unknown as ExtensionAPI);
   await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
-  const shortcut = pi.shortcuts.get("alt+shift+v");
-  assert.ok(shortcut, "alt+shift+v shortcut registered");
+  const shortcut = pi.shortcuts.get("ctrl+shift+i");
+  assert.ok(shortcut, "ctrl+shift+i shortcut registered");
   let notified = "";
   const sc = makeCtx({
     model: TEXT_ONLY,

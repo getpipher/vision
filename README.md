@@ -80,7 +80,7 @@ model should have `"input": ["text", "image"]`. Other `/vision` subcommands:
 | `/vision cache <clear\|show>` | Clear the cache or show stats (memory + disk entries) |
 | `/vision fallback <provider/model>\|clear` | Set/clear a fallback vision model |
 | `/vision clear` | Reset config to defaults |
-| `/vision-use [provider/model]` | Switch the DELEGATE vision model inline (no arg → picker). **Hotkey: `alt+shift+v`** (rebindable via `keybindings.json`) |
+| `/vision-use [provider/model]` | Switch the DELEGATE vision model inline (no arg → picker). **Hotkey: `ctrl+shift+i`** (rebindable via `keybindings.json`; on Mac, `alt`-based combos need `macos-option-as-alt=true`) |
 
 Config is stored at `~/.pi/agent/vision.json` (not `vision-tool.json`, so it
 doesn't collide with the community package during transition).
@@ -102,7 +102,7 @@ DELEGATE mode (text-only primary) is resilient + cheap:
   Configure both via the `/vision` panel or `/vision fallback <provider/model>`.
 - **Custom system prompt.** A per-workflow framing prepended to the
   vision-model request (`/vision system-prompt <text>`, or the panel row).
-- **Inline model switch.** `alt+shift+v` (or `/vision-use`) switches the
+- **Inline model switch.** `ctrl+shift+i` (or `/vision-use`) switches the
   DELEGATE vision model mid-session without opening the full panel.
 
 ## How it works
