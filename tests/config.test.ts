@@ -34,6 +34,10 @@ test("DEFAULT_CONFIG has the expected shape", () => {
     retryBackoffMs: 500,
     fallbackProvider: undefined,
     fallbackModel: undefined,
+    markerStyle: "code",
+    textOnlyPasteMode: "hint",
+    autoDelegatePrompt: "Describe this image concisely, focusing on visible content, text, diagrams, and layout.",
+    autoDelegateTimeoutMs: 30000,
   });
 });
 
@@ -315,4 +319,74 @@ test("applySettingChange: fallbackModel provider/id splits both; bare id keeps f
   assert.equal(bare.fallbackModel, "new-fb");
   const cleared = applySettingChange(base, "fallbackModel", "");
   assert.equal(cleared.fallbackModel, undefined);
+});
+
+// ── v0.3.0 (SPEC-3) fields ───────────────────────────────────────────────
+
+test("mergeConfig: v0.3.0 fields default when missing (forward-compat from v0.2.x)", () => {
+  const v02 = mergeConfig({ provider: "ollama", model: "m", enabled: true });
+  assert.equal(v02.markerStyle, "code");
+  assert.equal(v02.textOnlyPasteMode, "hint");
+  assert.equal(v02.autoDelegatePrompt, DEFAULT_CONFIG.autoDelegatePrompt);
+  assert.equal(v02.autoDelegateTimeoutMs, 30000);
+});
+
+test("mergeConfig: v0.3.0 fields pass through + validate", () => {
+  const c = mergeConfig({
+    markerStyle: "bold",
+    textOnlyPasteMode: "auto",
+    autoDelegatePrompt: "Custom prompt.",
+    autoDelegateTimeoutMs: 60000,
+  });
+  assert.equal(c.markerStyle, "bold");
+  assert.equal(c.textOnlyPasteMode, "auto");
+  assert.equal(c.autoDelegatePrompt, "Custom prompt.");
+  assert.equal(c.autoDelegateTimeoutMs, 60000);
+});
+
+test("mergeConfig: invalid markerStyle → default", () => {
+  assert.equal(mergeConfig({ markerStyle: "accent" }).markerStyle, "code");
+  assert.equal(mergeConfig({ markerStyle: 123 }).markerStyle, "code");
+});
+
+test("mergeConfig: invalid textOnlyPasteMode → default", () => {
+  assert.equal(mergeConfig({ textOnlyPasteMode: "always" }).textOnlyPasteMode, "hint");
+});
+
+test("mergeConfig: empty autoDelegatePrompt → default", () => {
+  assert.equal(mergeConfig({ autoDelegatePrompt: "  " }).autoDelegatePrompt, DEFAULT_CONFIG.autoDelegatePrompt);
+});
+
+test("mergeConfig: clamps autoDelegateTimeoutMs to [5000, 120000]", () => {
+  assert.equal(mergeConfig({ autoDelegateTimeoutMs: 1000 }).autoDelegateTimeoutMs, 5000);
+  assert.equal(mergeConfig({ autoDelegateTimeoutMs: 999999 }).autoDelegateTimeoutMs, 120000);
+});
+
+test("applySettingChange: markerStyle set valid / reject invalid", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "markerStyle", "bold").markerStyle, "bold");
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "markerStyle", "plain").markerStyle, "plain");
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "markerStyle", "accent").markerStyle, "code");
+});
+
+test("applySettingChange: textOnlyPasteMode set valid / reject invalid", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "textOnlyPasteMode", "auto").textOnlyPasteMode, "auto");
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "textOnlyPasteMode", "off").textOnlyPasteMode, "off");
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "textOnlyPasteMode", "bad").textOnlyPasteMode, "hint");
+});
+
+test("applySettingChange: autoDelegatePrompt set / empty → default", () => {
+  assert.equal(
+    applySettingChange(DEFAULT_CONFIG, "autoDelegatePrompt", "Analyze this.").autoDelegatePrompt,
+    "Analyze this.",
+  );
+  assert.equal(
+    applySettingChange(DEFAULT_CONFIG, "autoDelegatePrompt", "").autoDelegatePrompt,
+    DEFAULT_CONFIG.autoDelegatePrompt,
+  );
+});
+
+test("applySettingChange: autoDelegateTimeoutMs parse + clamp", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "60000").autoDelegateTimeoutMs, 60000);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "1000").autoDelegateTimeoutMs, 5000);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "999999").autoDelegateTimeoutMs, 120000);
 });
