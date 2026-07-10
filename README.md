@@ -81,6 +81,9 @@ model should have `"input": ["text", "image"]`. Other `/vision` subcommands:
 | `/vision fallback <provider/model>\|clear` | Set/clear a fallback vision model |
 | `/vision clear` | Reset config to defaults |
 | `/vision-use [provider/model]` | Switch the DELEGATE vision model inline (no arg → picker). **Hotkey: `ctrl+shift+i`** (rebindable via `keybindings.json`; on Mac, `alt`-based combos need `macos-option-as-alt=true`) |
+| `/vision paste-mode [hint\|auto\|off]` | Set how pasted images are handled on a text-only primary (no arg → cycle). |
+| `/vision marker-style [code\|bold\|plain]` | Set the markdown style for `[Image-#N]` markers (no arg → show current). |
+| `/vision auto-prompt [<text>\|clear]` | Set/clear the generic auto-delegation prompt (no arg → multi-line editor). |
 
 Config is stored at `~/.pi/agent/vision.json` (not `vision-tool.json`, so it
 doesn't collide with the community package during transition).
@@ -105,6 +108,29 @@ DELEGATE mode (text-only primary) is resilient + cheap:
 - **Inline model switch.** `ctrl+shift+i` (or `/vision-use`) switches the
   DELEGATE vision model mid-session without opening the full panel.
 
+## Paste UX (v0.3.0)
+
+When you reference an image file path in your message, the paste hook makes it
+visible and actionable — capability-aware for both multimodal and text-only
+primaries.
+
+- **[Image-#N] markers.** Image file paths in your message are replaced with
+  `[Image-#N]` markers (sequential, 1-indexed). The marker style is
+  configurable: `code` (inline code — default, visually distinct), `bold`, or
+  `plain`. On a multimodal primary, the image is also attached as a native
+  attachment (zero delegation). On a text-only primary, the marker is
+  informational — the image is NOT attached (text-only models can't process
+  images).
+- **Text-only paste modes.** When the primary model is text-only, pasted
+  images can't be processed natively. Three configurable modes:
+  - **hint** (default): markers + a hint line nudging the model to call
+    `describe_image`. Zero tokens — the model decides whether to delegate.
+  - **auto** (opt-in): auto-delegates each image via the v0.2.x pipeline
+    (cache/retry/fallback) and appends the descriptions to your message.
+    Timeout-protected (own AbortController, default 30s) — falls back to hint
+    on timeout or failure.
+  - **off**: markers only — no attachment, no hint, no delegation.
+
 ## How it works
 
 Two mechanisms combine to guarantee the behavior:
@@ -117,13 +143,13 @@ Two mechanisms combine to guarantee the behavior:
    added back so the LLM can delegate. The `model_select` event re-syncs on
    mid-session `/model` switches.
 
-2. **PASS-THROUGH delivery guarantee (mechanism B-lite).** When the primary
-   model is multimodal, a minimal `input` hook detects image file paths
-   referenced in your message and attaches them as native image content — so
-   the image reaches the model regardless of whether the LLM would otherwise
-   choose the built-in `read` tool. This makes "0 delegation for multimodal
-   primary" pass by construction, not by hope. The hook dedups by data hash so
-   it coexists cleanly with other paste extensions during transition.
+2. **Capability-aware paste hook.** When the primary model is multimodal,
+   the `input` hook detects image file paths in your message, attaches them as
+   native image content, and renders `[Image-#N]` markers (mechanism B-lite,
+   graduated in v0.3.0). On a text-only primary, the hook renders markers but
+   does NOT attach images — instead it hints, auto-delegates, or stays silent
+   based on `textOnlyPasteMode`. The hook dedups by data hash so it coexists
+   cleanly with other paste extensions during transition.
 
 ## Using `describe_image`
 
