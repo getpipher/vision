@@ -56,3 +56,21 @@ test("findImagePathTokens: URL with image ext is matched by regex but filtered l
   const out = findImagePathTokens("https://example.com/cat.png");
   assert.ok(out.length >= 1, "regex surfaces URL path-like token; existsSync filters it downstream");
 });
+test("findImagePathTokens: escaped-space path (terminal drag-paste on macOS)", () => {
+  const out = findImagePathTokens("/var/folders/NSIRD_screencaptureui/Screenshot\\ 2026-07-10\\ at\\ 10.30.43.png");
+  assert.equal(out.length, 1);
+  assert.ok(out[0]!.includes("Screenshot\\ 2026-07-10\\ at\\ 10.30.43.png"));
+});
+
+test("findImagePathTokens: escaped-space path followed by more text", () => {
+  const out = findImagePathTokens("analyze /tmp/My\\ Screenshot.png for bugs");
+  assert.equal(out.length, 1);
+  assert.equal(out[0], "/tmp/My\\ Screenshot.png");
+});
+
+test("findImagePathTokens: escaped + regular paths mixed", () => {
+  const out = findImagePathTokens("compare /tmp/a.png and /tmp/My\\ B.jpeg");
+  assert.equal(out.length, 2);
+  assert.equal(out[0], "/tmp/a.png");
+  assert.equal(out[1], "/tmp/My\\ B.jpeg");
+});

@@ -37,7 +37,11 @@ import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import type { ReasoningLevel } from "../lib/config.ts";
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
-const PATH_TOKEN_RE = /(?:\/|~\/|\.{1,2}\/)[^\s)"'<>]+\.(?:png|jpe?g|gif|webp|bmp)/gi;
+// Matches path-like tokens (absolute /…, home ~/…, relative ./…/…/) ending in a
+// known image extension. Allows \ (escaped space) which is what terminal
+// drag-and-drop produces on paths with spaces (common on macOS screenshots).
+// Unescaped-space paths are handled by the post-regex extension step below.
+const PATH_TOKEN_RE = /(?:\/|~\/|\.{1,2}\/)(?:\\ |[^\s)"'<>])+\.(?:png|jpe?g|gif|webp|bmp)/gi;
 
 /**
  * Extract candidate image file-path tokens from free text. Matches path-like
@@ -59,9 +63,12 @@ export function findImagePathTokens(text: string): string[] {
 }
 
 /** Resolve a token against cwd and return the absolute path if it's a real
- *  image file, else undefined. */
+ *  image file, else undefined. Unescapes \ (escaped spaces from terminal
+ *  drag-and-drop) before resolving. */
 function resolveImageFile(token: string, cwd: string): string | undefined {
-  const expanded = token.startsWith("~/") ? resolvePath(cwd, token) : token;
+  // Unescape \ → space (terminal drag-paste escaping)
+  const unescaped = token.replace(/\\ /g, " ");
+  const expanded = unescaped.startsWith("~/") ? resolvePath(cwd, unescaped) : unescaped;
   const abs = isAbsolute(expanded) ? expanded : resolvePath(cwd, expanded);
   if (!existsSync(abs)) return undefined;
   try {
