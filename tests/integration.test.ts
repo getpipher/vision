@@ -248,13 +248,14 @@ test("T2: text-only primary → describe_image visible + delegation fires + text
     await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
     assert.ok(pi.getActiveTools().includes("describe_image"), "describe_image must be visible for text-only primary");
 
-    // paste hook must NOT attach for text-only (text-only uses DELEGATE)
+    // v0.3.0: paste hook transforms text-only too (markers + hint) but does NOT attach images
     const inputResult = await pi.emit(
       "input",
       { type: "input", text: `describe ${file}`, source: "interactive", images: [] },
       makeCtx({ model: TEXT_ONLY, cwd: dir }),
     );
-    assert.equal(inputResult?.action ?? "continue", "continue", "paste hook skips text-only models");
+    assert.equal(inputResult?.action ?? "continue", "transform", "paste hook transforms text-only (markers + hint)");
+    assert.equal((inputResult?.images ?? []).length, 0, "paste hook does NOT attach images for text-only primary");
 
     // Configure + execute → delegation
     await runVisionCommand(pi, "provider ollama", TEXT_ONLY);

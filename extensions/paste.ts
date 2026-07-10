@@ -1,28 +1,40 @@
 /**
- * @getpipher/vision — paste extension (B-lite PASS-THROUGH delivery).
+ * @getpither/vision — paste extension (SPEC-3: graduated from B-lite).
  *
- * Minimal `input` hook that GUARANTEES image file paths referenced in the
- * user's message reach a multimodal primary model as native attachments —
- * regardless of whether the LLM would otherwise choose the built-in `read`
- * tool. This makes SPEC-1 T1 (0 delegation for multimodal primary) pass by
- * construction.
+ * Input event hook that makes pasted/referenced images visible + actionable
+ * end-to-end, capability-aware for both multimodal AND text-only primaries.
  *
- * Scope (v0.1.0): PASS-THROUGH delivery ONLY. No clipboard handling, no
- * `[Image-#N]` markers, no colors, no TUI preview, no editor component — all
- * of that is SPEC-3. This hook fires only when the active model is
- * multimodal; text-only models use `describe_image` (DELEGATE) instead.
+ * **Multimodal primary** (PASS-THROUGH): attaches images as native
+ * attachments (B-lite delivery guarantee) + renders `[Image-#N]` markers in
+ * the text (gap #6). Zero delegation — the model sees the image natively.
+ *
+ * **Text-only primary** (capability-aware branching, gap #8): does NOT
+ * attach images (text-only models can't process them). Renders markers +
+ * branches on `textOnlyPasteMode`:
+ * - `"hint"` (default): markers + a hint line nudging the model to call
+ *   `describe_image`. Zero tokens — the model decides.
+ * - `"auto"` (opt-in): auto-delegates each image via the v0.2.x pipeline
+ *   (cache/retry/fallback) + appends descriptions. Timeout-protected (own
+ *   AbortController); falls back to hint on timeout/failure.
+ * - `"off"`: markers only — no attachment, no hint, no delegation.
  *
  * Coexistence with pi-paster: pi-paster matches its own `[#image N]`
  * placeholders (different trigger); this hook matches file paths. Transforms
- * chain across handlers, and we dedup by data hash against `event.images` so
- * the same image is never attached twice.
+ * chain across handlers, and we dedup by data hash against `event.images`.
+ *
+ * Config + cache are shared via `lib/state.ts` (set by vision.ts on
+ * session_start + every mutation).
  */
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve as resolvePath } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { isMultimodal } from "../lib/capability.ts";
 import { loadImage } from "../lib/image.ts";
+import { renderMarkers, buildHintLine, buildDescriptionsBlock } from "../lib/marker.ts";
+import { getSharedConfig, getSharedCache } from "../lib/state.ts";
+import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
+import type { ReasoningLevel } from "../lib/config.ts";
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 const PATH_TOKEN_RE = /(?:\/|~\/|\.{1,2}\/)[^\s)"'<>]+\.(?:png|jpe?g|gif|webp|bmp)/gi;
@@ -72,49 +84,202 @@ function hashData(data: string): string {
   return (h >>> 0).toString(16);
 }
 
+/** A loaded image ready for attachment or delegation. */
+interface LoadedImage {
+  token: string;
+  abs: string;
+  data: string;
+  mimeType: string;
+  hash: string;
+}
+
+/** Load + dedup all resolvable tokens. Returns the loaded images + the
+ *  set of hashes already seen (for dedup). */
+async function loadAndDedup(
+  tokens: string[],
+  existingImages: ImageContent[],
+  cwd: string,
+): Promise<{ loaded: LoadedImage[]; existingHashes: Set<string> }> {
+  const existingHashes = new Set(existingImages.map((img) => hashData(img.data)));
+  const loaded: LoadedImage[] = [];
+  const seenPaths = new Set<string>();
+
+  for (const token of tokens) {
+    const abs = resolveImageFile(token, cwd);
+    if (!abs || seenPaths.has(abs)) continue;
+    seenPaths.add(abs);
+    const result = await loadImage(abs, {
+      compress: true,
+      maxDimension: 1568,
+      jpegQuality: 85,
+      cwd,
+    });
+    if (!result.ok) continue; // skip unreadable images
+    const hash = hashData(result.image.data);
+    if (existingHashes.has(hash)) continue; // already attached (e.g. by pi-paster)
+    existingHashes.add(hash);
+    loaded.push({ token, abs, data: result.image.data, mimeType: result.image.mimeType, hash });
+  }
+
+  return { loaded, existingHashes };
+}
+
+/** Build the resolved map for renderMarkers: token → index in the final
+ *  images array. For multimodal, index = offset + position among loaded.
+ *  For dedup'd images (hash matches existing), the marker points to the
+ *  existing index. For text-only (no attachment), markers are sequential
+ *  starting from the offset. */
+function buildResolvedMap(
+  tokens: string[],
+  loaded: LoadedImage[],
+  existingImages: ImageContent[],
+  isMultimodalModel: boolean,
+): Map<string, { index: number }> {
+  const resolved = new Map<string, { index: number }>();
+  const offset = existingImages.length;
+
+  // For dedup: build a hash → existing-index lookup.
+  const existingHashToIndex = new Map<string, number>();
+  existingImages.forEach((img, i) => {
+    existingHashToIndex.set(hashData(img.data), i);
+  });
+
+  let newImageIndex = 0;
+  for (const token of tokens) {
+    // Find if this token was loaded.
+    const found = loaded.find((l) => l.token === token);
+    if (!found) continue; // unresolvable → not in resolved map → left as-is
+
+    // Check if it was dedup'd (hash matches an existing image).
+    const existingIdx = existingHashToIndex.get(found.hash);
+    if (existingIdx !== undefined) {
+      resolved.set(token, { index: existingIdx });
+    } else {
+      // New image.
+      const idx = isMultimodalModel ? offset + newImageIndex : newImageIndex;
+      resolved.set(token, { index: idx });
+      newImageIndex++;
+    }
+  }
+
+  return resolved;
+}
+
+/** Auto-delegate a single image with timeout protection. Returns the
+ *  description text or undefined on failure/timeout (caller falls back to hint). */
+async function autoDelegateOne(
+  ctx: ExtensionContext,
+  config: NonNullable<ReturnType<typeof getSharedConfig>>,
+  image: LoadedImage,
+  cache: NonNullable<ReturnType<typeof getSharedCache>>,
+): Promise<{ text: string; cached: boolean } | undefined> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.autoDelegateTimeoutMs);
+  try {
+    const params: DelegateParams = {
+      image_path: image.abs,
+      prompt: config.autoDelegatePrompt,
+      compress: true,
+      reasoning: "off" as ReasoningLevel,
+    };
+    const result = await delegateToVisionModel(ctx, config, params, controller.signal, cache);
+    if (result.ok) {
+      return { text: result.text, cached: result.details.cached };
+    }
+    return undefined; // failure → caller falls back to hint
+  } catch {
+    return undefined; // timeout or error → hint fallback
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export default function pasteExtension(_pi: ExtensionAPI): void {
   _pi.on("input", async (event, ctx) => {
     // Don't re-process messages we (or another extension) injected.
     if (event.source === "extension") return { action: "continue" as const };
-    // Only attach for multimodal primary models; text-only models use
-    // describe_image (DELEGATE) and would waste tokens on attachments they
-    // can't process.
-    if (!isMultimodal(ctx.model)) return { action: "continue" as const };
+
+    const config = getSharedConfig();
+    if (!config) return { action: "continue" as const }; // before session_start
 
     const tokens = findImagePathTokens(event.text);
     if (tokens.length === 0) return { action: "continue" as const };
 
-    const existingHashes = new Set((event.images ?? []).map((img) => hashData(img.data)));
-    const newImages: ImageContent[] = [];
-    const seenPaths = new Set<string>();
+    const multimodal = isMultimodal(ctx.model);
+    const { loaded, existingHashes } = await loadAndDedup(
+      tokens,
+      event.images ?? [],
+      ctx.cwd,
+    );
 
-    for (const token of tokens) {
-      const abs = resolveImageFile(token, ctx.cwd);
-      if (!abs || seenPaths.has(abs)) continue;
-      seenPaths.add(abs);
-      const loaded = await loadImage(abs, {
-        compress: true,
-        maxDimension: 1568,
-        jpegQuality: 85,
-        cwd: ctx.cwd,
-      });
-      if (!loaded.ok) continue; // skip unreadable images; the tool path errors clearly
-      const hash = hashData(loaded.image.data);
-      if (existingHashes.has(hash)) continue; // already attached (e.g. by pi-paster)
-      existingHashes.add(hash);
-      newImages.push({
-        type: "image",
-        data: loaded.image.data,
-        mimeType: loaded.image.mimeType,
-      });
+    if (loaded.length === 0) return { action: "continue" as const };
+
+    // Build the resolved map (token → index for marker numbering).
+    const resolved = buildResolvedMap(tokens, loaded, event.images ?? [], multimodal);
+
+    // Render markers in the text.
+    let text = renderMarkers(event.text, tokens, resolved, config.markerStyle);
+
+    if (multimodal) {
+      // ── MULTIMODAL: attach images + markers (B-lite delivery + gap #6) ──
+      const newImages: ImageContent[] = loaded.map((l) => ({
+        type: "image" as const,
+        data: l.data,
+        mimeType: l.mimeType,
+      }));
+      return {
+        action: "transform" as const,
+        text,
+        images: [...(event.images ?? []), ...newImages],
+      };
     }
 
-    if (newImages.length === 0) return { action: "continue" as const };
+    // ── TEXT-ONLY: no attachment (text-only models can't process images) ──
+    const mode = config.textOnlyPasteMode;
 
-    return {
-      action: "transform" as const,
-      text: event.text,
-      images: [...(event.images ?? []), ...newImages],
-    };
+    if (mode === "off") {
+      // Markers only — no attachment, no hint, no delegation.
+      return { action: "transform" as const, text };
+    }
+
+    if (mode === "hint") {
+      // Markers + hint line nudging the model to call describe_image.
+      text = `${text}\n${buildHintLine(loaded.length)}`;
+      return { action: "transform" as const, text };
+    }
+
+    // mode === "auto": auto-delegate each image + append descriptions.
+    const cache = getSharedCache();
+    const visionModel = config.provider && config.model ? `${config.provider}/${config.model}` : "(unconfigured)";
+
+    if (!cache || !config.provider || !config.model) {
+      // Can't delegate (no cache or unconfigured) → fall back to hint.
+      text = `${text}\n${buildHintLine(loaded.length)}`;
+      return { action: "transform" as const, text };
+    }
+
+    const descriptions: Array<{ token: string; index: number; text: string; cached: boolean }> = [];
+    let allFailed = true;
+
+    for (const image of loaded) {
+      const result = await autoDelegateOne(ctx, config, image, cache);
+      if (result) {
+        const idx = resolved.get(image.token)?.index ?? 0;
+        descriptions.push({ token: image.token, index: idx, text: result.text, cached: result.cached });
+        allFailed = false;
+      }
+      // On undefined (failure/timeout) → that image gets no description.
+      // If ALL fail, we fall back to hint below.
+    }
+
+    if (allFailed) {
+      // All delegations failed → hint fallback for all images.
+      text = `${text}\n${buildHintLine(loaded.length)}`;
+      return { action: "transform" as const, text };
+    }
+
+    // Append the descriptions block.
+    text = `${text}${buildDescriptionsBlock(descriptions, visionModel)}`;
+    return { action: "transform" as const, text };
   });
 }
