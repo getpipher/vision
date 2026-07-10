@@ -28,6 +28,7 @@ import {
   Container,
   type Component,
   Input,
+  Key,
   SettingsList,
   type SettingItem,
   SelectItem,
@@ -566,7 +567,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
             ctx.ui.notify("Vision cache cleared (memory + disk).", "info");
           } else if (action === "show") {
             const s = cache.stats();
-            ctx.ui.notify(`Vision cache: ${s.memoryEntries} memory, ${s.diskEntries} disk (max ${s.maxEntries}, persisted ${s.persisted}).`, "info");
+            ctx.ui.notify(`Vision cache: ${s.memoryEntries} memory, ${s.diskEntries} disk (max ${s.maxEntries}, persisted ${s.persisted}). Memory is session-scoped; enable \"Persist cache to disk\" for cross-session hits.`, "info");
           } else {
             ctx.ui.notify("Usage: /vision cache <clear|show>", "warning");
           }
@@ -604,13 +605,15 @@ export default function visionExtension(pi: ExtensionAPI): void {
     },
   });
 
-  // ── /vision-use command + alt+shift+v hotkey (SPEC-2 gap #5: inline switch) ─
+  // ── /vision-use command + ctrl+shift+i hotkey (SPEC-2 gap #5: inline switch) ─
   // Both switch the DELEGATE vision model mid-session without the full panel.
   // Tool visibility is unaffected (it tracks the PRIMARY model's capability,
-  // not the vision model) so no resync is needed.
+  // not the vision model) so no resync is needed. The hotkey uses ctrl+shift+i
+  // (not alt+) so it works on Mac terminals where Option≠Alt by default
+  ﻿//  (e.g. Ghostty macos-option-as-alt=false). Rebindable via keybindings.json.
   pi.registerCommand("vision-use", {
     description:
-      "Switch the DELEGATE vision model inline. No arg → picker; <provider/model> → set directly. (Hotkey: alt+shift+v)",
+      "Switch the DELEGATE vision model inline. No arg → picker; <provider/model> → set directly. (Hotkey: ctrl+shift+i)",
     handler: async (args, ctx) => {
       const value = args.trim();
       if (!value) {
@@ -629,7 +632,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerShortcut("alt+shift+v", {
+  pi.registerShortcut(Key.ctrlShift("i"), {
     description: "Switch vision model (inline picker)",
     handler: async (ctx) => {
       const picked = await pickVisionModel(ctx);
