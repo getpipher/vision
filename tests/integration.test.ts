@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, ImageContent } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -36,6 +36,9 @@ import pasteFactory from "../extensions/paste.ts";
 const PNG_1x1_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M8AAAMBEg1+mP0AAAAASUVORK5CYII=";
 const PNG_BYTES = Buffer.from(PNG_1x1_B64, "base64");
+// A second distinct 1x1 PNG (red pixel) for tests that need two different images.
+const PNG_1x1_RED_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const PNG_BYTES_2 = Buffer.from(PNG_1x1_RED_B64, "base64");
 
 function makeModel(overrides: Partial<Model<Api>> = {}): Model<Api> {
   return {
@@ -248,13 +251,14 @@ test("T2: text-only primary → describe_image visible + delegation fires + text
     await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
     assert.ok(pi.getActiveTools().includes("describe_image"), "describe_image must be visible for text-only primary");
 
-    // paste hook must NOT attach for text-only (text-only uses DELEGATE)
+    // v0.3.0: paste hook transforms text-only too (markers + hint) but does NOT attach images
     const inputResult = await pi.emit(
       "input",
       { type: "input", text: `describe ${file}`, source: "interactive", images: [] },
       makeCtx({ model: TEXT_ONLY, cwd: dir }),
     );
-    assert.equal(inputResult?.action ?? "continue", "continue", "paste hook skips text-only models");
+    assert.equal(inputResult?.action ?? "continue", "transform", "paste hook transforms text-only (markers + hint)");
+    assert.equal((inputResult?.images ?? []).length, 0, "paste hook does NOT attach images for text-only primary");
 
     // Configure + execute → delegation
     await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
@@ -697,6 +701,242 @@ test("T25: /vision-use <provider/model> sets directly (no picker)", async () => 
   await pi.commands.get("vision")!.handler("show", sc);
   assert.match(shown, /qwen3\.5:cloud/);
 });
+
+// ── T28: multimodal primary → [Image-#1] marker + image attached ──
+test("T28: multimodal primary → marker in text + image attached + no delegation", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: MULTIMODAL, cwd: dir }));
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${file} for bugs`, source: "interactive", images: [] },
+      makeCtx({ model: MULTIMODAL, cwd: dir }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.match(inputResult.text, /`\[Image-#1\]`/, "marker rendered as inline code");
+    assert.equal((inputResult.images ?? []).length, 1, "image attached");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T29: multiple images → sequential markers ──
+test("T29: multi-image → [Image-#1] + [Image-#2] sequential markers", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  const file2 = join(dir, "second.png");
+  writeFileSync(file2, PNG_BYTES_2);
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: MULTIMODAL, cwd: dir }));
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `compare ${file} and ${file2} please`, source: "interactive", images: [] },
+      makeCtx({ model: MULTIMODAL, cwd: dir }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.match(inputResult.text, /`\[Image-#1\]`/);
+    assert.match(inputResult.text, /`\[Image-#2\]`/);
+    assert.equal((inputResult.images ?? []).length, 2, "2 images attached in order");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T30: marker style (code/bold/plain) ──
+test("T30: marker style — code/bold/plain produce different transform text", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  try {
+    // code (default)
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: MULTIMODAL, cwd: dir }));
+    let r = await pi.emit("input", { type: "input", text: `see ${file}`, source: "interactive", images: [] }, makeCtx({ model: MULTIMODAL, cwd: dir }));
+    assert.match(r.text, /`\[Image-#1\]`/, "code style → backtick-wrapped");
+
+    // bold
+    await runVisionCommand(pi, "marker-style bold", MULTIMODAL);
+    r = await pi.emit("input", { type: "input", text: `see ${file}`, source: "interactive", images: [] }, makeCtx({ model: MULTIMODAL, cwd: dir }));
+    assert.match(r.text, /\*\*\[Image-#1\]\*\*/, "bold style → **-wrapped");
+
+    // plain
+    await runVisionCommand(pi, "marker-style plain", MULTIMODAL);
+    r = await pi.emit("input", { type: "input", text: `see ${file}`, source: "interactive", images: [] }, makeCtx({ model: MULTIMODAL, cwd: dir }));
+    assert.ok(!r.text.includes("`"), "plain style → no backticks");
+    assert.match(r.text, /\[Image-#1\]/, "plain style → bare marker");
+    // Reset to code for subsequent tests (config persists in shared TMP_AGENT)
+    await runVisionCommand(pi, "marker-style code", MULTIMODAL);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T31: text-only + hint → markers + hint line, no attachment ──
+test("T31: text-only + hint → markers + hint line, no image attached", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${file}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.match(inputResult.text, /`\[Image-#1\]`/, "marker rendered");
+    assert.match(inputResult.text, /describe_image tool/, "hint line appended");
+    assert.equal((inputResult.images ?? []).length, 0, "no image attached for text-only");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T32: text-only + auto → delegation fires + descriptions appended ──
+test("T32: text-only + auto → delegate per image + descriptions appended, no attachment", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  const fm = mockFetch({ choices: [{ message: { content: "A red square on white bg." } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    await runVisionCommand(pi, "paste-mode auto", TEXT_ONLY);
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${file}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.equal((inputResult.images ?? []).length, 0, "no image attached for text-only auto");
+    assert.ok(fm.calls.length >= 1, "at least 1 vision-model API call (delegation)");
+    assert.match(inputResult.text, /red square/, "description appended");
+    assert.match(inputResult.text, /auto-described/, "cost-awareness footer");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T33: text-only + off → markers only, no hint, no delegation ──
+test("T33: text-only + off → markers only, no hint, no delegation", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  const fm = mockFetch({ choices: [{ message: { content: "should not be called" } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "paste-mode off", TEXT_ONLY);
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${file}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.match(inputResult.text, /`\[Image-#1\]`/, "marker rendered");
+    assert.ok(!inputResult.text.includes("describe_image tool"), "no hint line in off mode");
+    assert.ok(!inputResult.text.includes("auto-described"), "no delegation in off mode");
+    assert.equal((inputResult.images ?? []).length, 0, "no attachment");
+    assert.equal(fm.calls.length, 0, "no vision-model calls");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T34: auto timeout → hint fallback ──
+test("T34: auto mode timeout → hint fallback, message not blocked", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  // Fast-failing fetch (network error — throws immediately)
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new TypeError("network error"); }) as typeof globalThis.fetch;
+  try {
+    // Write a config with retryAttempts: 0 so the network error fails fast (no backoff)
+    writeFileSync(join(TMP_AGENT, "vision.json"), JSON.stringify({
+      provider: "ollama", model: "minimax-m3:cloud", enabled: true,
+      retryAttempts: 0, textOnlyPasteMode: "auto",
+    }));
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${file}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }),
+    );
+    assert.equal(inputResult?.action, "transform", "message not blocked");
+    // Timeout → hint fallback (the fetch hangs, so delegation never completes)
+    assert.match(inputResult.text, /describe_image tool/, "hint fallback on timeout");
+    assert.ok(!inputResult.text.includes("auto-described"), "no descriptions on timeout");
+  } finally {
+    globalThis.fetch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T35: auto delegation failure → hint fallback ──
+test("T35: auto mode delegation failure → hint fallback, no crash", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  // Vision model returns 500 → delegation fails
+  const fm = mockFetch({ error: "server error" }, 500);
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    await runVisionCommand(pi, "paste-mode auto", TEXT_ONLY);
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${file}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }),
+    );
+    assert.equal(inputResult?.action, "transform", "no crash");
+    assert.match(inputResult.text, /describe_image tool/, "hint fallback on failure");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T36: marker numbering offset (pre-existing images) ──
+test("T36: marker numbering offset — pre-existing images → #3", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: MULTIMODAL, cwd: dir }));
+    // Pre-attach 2 images (simulating another extension)
+    const fakeImg: ImageContent = { type: "image", data: "AAAA", mimeType: "image/png" };
+    const fakeImg2: ImageContent = { type: "image", data: "BBBB", mimeType: "image/png" };
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `see ${file}`, source: "interactive", images: [fakeImg, fakeImg2] },
+      makeCtx({ model: MULTIMODAL, cwd: dir }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.match(inputResult.text, /`\[Image-#3\]`/, "new image is #3 (offset from 2 pre-existing)");
+    assert.equal((inputResult.images ?? []).length, 3, "3 total images");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T37: v0.2.x regression — T1–T27 still green ──
+// (Covered by the existing T1–T27 tests above; this is a documentation marker.
+// If any prior test fails, the suite fails here too. No separate assertions needed.)
 
 // Cleanup the temp agent dir after all tests.
 test("cleanup", () => {

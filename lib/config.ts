@@ -14,8 +14,17 @@
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { MarkerStyle } from "./marker.ts";
 
 export type ReasoningLevel = ModelThinkingLevel;
+
+export const MARKER_STYLES: readonly MarkerStyle[] = ["code", "bold", "plain"] as const;
+
+export const PASTE_MODES = ["hint", "auto", "off"] as const;
+export type PasteMode = (typeof PASTE_MODES)[number];
+
+export const DEFAULT_AUTO_DELEGATE_PROMPT =
+  "Describe this image concisely, focusing on visible content, text, diagrams, and layout.";
 
 export const REASONING_LEVELS: readonly ReasoningLevel[] = [
   "off",
@@ -56,6 +65,16 @@ export interface VisionConfig {
   fallbackProvider: string | undefined;
   /** Fallback vision model id under fallbackProvider. */
   fallbackModel: string | undefined;
+  // ── v0.3.0 (SPEC-3) ──────────────────────────────────────────────────────
+  /** Markdown style for [Image-#N] markers: "code" (inline code), "bold", or "plain". */
+  markerStyle: MarkerStyle;
+  /** How pasted images are handled when the primary model is text-only:
+   *  "hint" (default, zero-token nudge), "auto" (auto-delegate), "off" (markers only). */
+  textOnlyPasteMode: PasteMode;
+  /** Generic prompt for auto-delegation in text-only + "auto" mode. */
+  autoDelegatePrompt: string;
+  /** Timeout (ms) for auto-delegation in the input hook (own AbortController). */
+  autoDelegateTimeoutMs: number;
 }
 
 export const DEFAULT_CONFIG: VisionConfig = {
@@ -74,6 +93,11 @@ export const DEFAULT_CONFIG: VisionConfig = {
   retryBackoffMs: 500,
   fallbackProvider: undefined,
   fallbackModel: undefined,
+  // v0.3.0 defaults
+  markerStyle: "code",
+  textOnlyPasteMode: "hint",
+  autoDelegatePrompt: DEFAULT_AUTO_DELEGATE_PROMPT,
+  autoDelegateTimeoutMs: 30000,
 };
 
 export const CONFIG_FILENAME = "vision.json";
@@ -85,6 +109,14 @@ export function configFilePath(agentDir: string): string {
 
 function isReasoningLevel(value: unknown): value is ReasoningLevel {
   return typeof value === "string" && (REASONING_LEVELS as readonly string[]).includes(value);
+}
+
+function isMarkerStyle(value: unknown): value is MarkerStyle {
+  return typeof value === "string" && (MARKER_STYLES as readonly string[]).includes(value);
+}
+
+function isPasteMode(value: unknown): value is PasteMode {
+  return typeof value === "string" && (PASTE_MODES as readonly string[]).includes(value);
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {
@@ -122,6 +154,11 @@ export function mergeConfig(partial: unknown): VisionConfig {
     retryBackoffMs: clampInt(p.retryBackoffMs, 0, 60000, DEFAULT_CONFIG.retryBackoffMs),
     fallbackProvider: strOrUndef(p.fallbackProvider),
     fallbackModel: strOrUndef(p.fallbackModel),
+    // v0.3.0 fields
+    markerStyle: isMarkerStyle(p.markerStyle) ? p.markerStyle : DEFAULT_CONFIG.markerStyle,
+    textOnlyPasteMode: isPasteMode(p.textOnlyPasteMode) ? p.textOnlyPasteMode : DEFAULT_CONFIG.textOnlyPasteMode,
+    autoDelegatePrompt: strOrUndef(p.autoDelegatePrompt) ?? DEFAULT_CONFIG.autoDelegatePrompt,
+    autoDelegateTimeoutMs: clampInt(p.autoDelegateTimeoutMs, 5000, 120000, DEFAULT_CONFIG.autoDelegateTimeoutMs),
   };
 }
 
@@ -220,6 +257,21 @@ export function applySettingChange(
         return { ...config, fallbackProvider: value.slice(0, slash), fallbackModel: value.slice(slash + 1) };
       }
       return { ...config, fallbackModel: value.length > 0 ? value : undefined };
+    }
+    // ── v0.3.0 fields ──────────────────────────────────────────────────────
+    case "markerStyle":
+      if (isMarkerStyle(value)) return { ...config, markerStyle: value };
+      return config;
+    case "textOnlyPasteMode":
+      if (isPasteMode(value)) return { ...config, textOnlyPasteMode: value };
+      return config;
+    case "autoDelegatePrompt":
+      // Empty string → default; otherwise the typed text.
+      return { ...config, autoDelegatePrompt: value.trim().length > 0 ? value.trim() : DEFAULT_CONFIG.autoDelegatePrompt };
+    case "autoDelegateTimeoutMs": {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, autoDelegateTimeoutMs: Math.min(120000, Math.max(5000, n)) };
     }
     default:
       return config;
