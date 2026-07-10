@@ -40,6 +40,8 @@ import {
   applySettingChange,
   DEFAULT_CONFIG,
   loadConfig,
+  MARKER_STYLES,
+  PASTE_MODES,
   REASONING_LEVELS,
   saveConfig,
   type ReasoningLevel,
@@ -47,6 +49,7 @@ import {
 } from "../lib/config.ts";
 import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import { VisionCache } from "../lib/cache.ts";
+import { setSharedState } from "../lib/state.ts";
 
 /** Current config. Loaded on session_start, mutated by /vision, saved to disk. */
 let config: VisionConfig = { ...DEFAULT_CONFIG };
@@ -58,6 +61,7 @@ let cache: VisionCache = new VisionCache(undefined, DEFAULT_CONFIG.cacheMaxEntri
 function rebuildCache(): void {
   const dir = config.cachePersist ? join(getAgentDir(), "vision-cache") : undefined;
   cache = new VisionCache(dir, config.cacheMaxEntries);
+  setSharedState(config, cache);
 }
 
 const SUBCOMMANDS = [
@@ -73,6 +77,9 @@ const SUBCOMMANDS = [
   "cache",
   "fallback",
   "clear",
+  "paste-mode",
+  "marker-style",
+  "auto-prompt",
 ] as const;
 
 function formatConfigStatus(c: VisionConfig): string {
@@ -88,6 +95,10 @@ function formatConfigStatus(c: VisionConfig): string {
     `  cache:           ${c.cacheEnabled ? "on" : "off"}${c.cachePersist ? " (persisted, max " + c.cacheMaxEntries + ")" : ""}`,
     `  retry:           ${c.retryAttempts} attempts, ${c.retryBackoffMs}ms backoff`,
     `  fallback:        ${c.fallbackProvider && c.fallbackModel ? c.fallbackProvider + "/" + c.fallbackModel : "(none)"}`,
+    `  markerStyle:     ${c.markerStyle}`,
+    `  textOnlyPaste:   ${c.textOnlyPasteMode}`,
+    `  autoPrompt:      ${c.autoDelegatePrompt ? truncatePreview(c.autoDelegatePrompt, 40) : "(default)"}`,
+    `  autoTimeout:     ${c.autoDelegateTimeoutMs}ms`,
   ].join("\n");
 }
 
@@ -124,6 +135,14 @@ function renderValue(id: string): string {
       return `${config.retryBackoffMs}ms`;
     case "fallbackModel":
       return config.fallbackProvider && config.fallbackModel ? `${config.fallbackProvider}/${config.fallbackModel}` : "(none)";
+    case "markerStyle":
+      return config.markerStyle;
+    case "textOnlyPasteMode":
+      return config.textOnlyPasteMode;
+    case "autoDelegatePrompt":
+      return config.autoDelegatePrompt ? truncatePreview(config.autoDelegatePrompt, 40) : "(default)";
+    case "autoDelegateTimeoutMs":
+      return `${config.autoDelegateTimeoutMs}ms`;
     default:
       return "";
   }
@@ -139,6 +158,7 @@ function resync(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
 function applyAndSave(id: string, value: string, pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   config = applySettingChange(config, id, value);
   saveConfig(config, getAgentDir());
+  setSharedState(config, cache);
   if (id === "enabled" || id === "model") resync(pi, ctx);
   if (id === "cachePersist" || id === "cacheMaxEntries") rebuildCache();
 }
@@ -269,6 +289,35 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
         description: "Secondary vision model tried when the primary exhausts retries or fails non-retryable. Enter opens a picker.",
         submenu: (_cur, subDone) => buildModelSubmenu(theme, ctx, subDone),
       },
+      // ── v0.3.0 (SPEC-3) rows ────────────────────────────────────────────
+      {
+        id: "markerStyle",
+        label: "Marker style",
+        currentValue: renderValue("markerStyle"),
+        values: [...MARKER_STYLES],
+        description: "Markdown style for [Image-#N] markers: code (inline code), bold, or plain.",
+      },
+      {
+        id: "textOnlyPasteMode",
+        label: "Text-only paste mode",
+        currentValue: renderValue("textOnlyPasteMode"),
+        values: [...PASTE_MODES],
+        description: "How pasted images are handled on a text-only primary: hint (nudge to call describe_image), auto (auto-delegate), off (markers only).",
+      },
+      {
+        id: "autoDelegatePrompt",
+        label: "Auto-delegate prompt",
+        currentValue: renderValue("autoDelegatePrompt"),
+        description: "Generic prompt for auto-delegation in text-only + auto mode. Enter to edit inline (single-line). For multi-line, use /vision auto-prompt.",
+        submenu: (cur, subDone) => buildAutoPromptInput(cur, subDone),
+      },
+      {
+        id: "autoDelegateTimeoutMs",
+        label: "Auto-delegate timeout",
+        currentValue: renderValue("autoDelegateTimeoutMs"),
+        values: ["10000ms", "20000ms", "30000ms", "60000ms"],
+        description: "Timeout for auto-delegation in the paste hook (per-image AbortController). Falls back to hint on timeout.",
+      },
     ];
 
     const settingsList = new SettingsList(
@@ -344,11 +393,24 @@ function buildSystemPromptInput(
   return input;
 }
 
+/** Build the single-line auto-delegate-prompt editor (mirrors buildSystemPromptInput). */
+function buildAutoPromptInput(
+  currentValue: string,
+  subDone: (selectedValue?: string) => void,
+): Component {
+  const input = new Input();
+  input.setValue(currentValue === "(default)" ? "" : currentValue);
+  input.onSubmit = (value) => subDone(value);
+  input.onEscape = () => subDone();
+  return input;
+}
+
 export default function visionExtension(pi: ExtensionAPI): void {
   // ── Session lifecycle ───────────────────────────────────────────────────
   pi.on("session_start", (_event, ctx) => {
     config = loadConfig(getAgentDir());
     rebuildCache();
+    setSharedState(config, cache);
     syncToolAvailability(pi, ctx.model, { enabled: config.enabled });
   });
 
@@ -593,6 +655,56 @@ export default function visionExtension(pi: ExtensionAPI): void {
           }
           saveConfig(config, agentDir);
           ctx.ui.notify(`Fallback vision model set to ${config.fallbackProvider}/${config.fallbackModel}.`, "info");
+          return;
+        }
+        case "paste-mode": {
+          const value = parts[1];
+          if (!value) {
+            const order = PASTE_MODES as readonly string[];
+            const next = order[(order.indexOf(config.textOnlyPasteMode) + 1) % order.length] ?? "hint";
+            config = applySettingChange(config, "textOnlyPasteMode", next);
+          } else {
+            config = applySettingChange(config, "textOnlyPasteMode", value);
+          }
+          saveConfig(config, agentDir);
+          setSharedState(config, cache);
+          ctx.ui.notify(`Text-only paste mode set to ${config.textOnlyPasteMode}.`, "info");
+          return;
+        }
+        case "marker-style": {
+          const value = parts[1];
+          if (!value) {
+            ctx.ui.notify(`Marker style: ${config.markerStyle}. Valid: ${MARKER_STYLES.join(", ")}`, "info");
+            return;
+          }
+          config = applySettingChange(config, "markerStyle", value);
+          saveConfig(config, agentDir);
+          setSharedState(config, cache);
+          ctx.ui.notify(
+            config.markerStyle === value ? `Marker style set to ${value}.` : `Invalid style. Valid: ${MARKER_STYLES.join(", ")}`,
+            config.markerStyle === value ? "info" : "warning",
+          );
+          return;
+        }
+        case "auto-prompt": {
+          const value = parts.slice(1).join(" ").trim();
+          if (!value) {
+            if (ctx.hasUI) {
+              const edited = await ctx.ui.editor("Auto-delegate prompt", config.autoDelegatePrompt === DEFAULT_CONFIG.autoDelegatePrompt ? "" : config.autoDelegatePrompt);
+              if (edited === undefined) return;
+              config = applySettingChange(config, "autoDelegatePrompt", edited);
+            } else {
+              ctx.ui.notify("Usage: /vision auto-prompt <text> (or /vision auto-prompt clear)", "warning");
+              return;
+            }
+          } else if (value === "clear") {
+            config = applySettingChange(config, "autoDelegatePrompt", "");
+          } else {
+            config = applySettingChange(config, "autoDelegatePrompt", value);
+          }
+          saveConfig(config, agentDir);
+          setSharedState(config, cache);
+          ctx.ui.notify(config.autoDelegatePrompt === DEFAULT_CONFIG.autoDelegatePrompt ? "Auto-delegate prompt reset to default." : "Auto-delegate prompt set.", "info");
           return;
         }
         default: {
