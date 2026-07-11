@@ -56,6 +56,8 @@ import { matchesKey } from "@earendil-works/pi-tui";
 import { loadImage } from "../lib/image.ts";
 import { mapWithConcurrency } from "../lib/batch.ts";
 import { buildBatchToolResult } from "../lib/marker.ts";
+import { autoDetectDefaults } from "../lib/defaults.ts";
+import { clearAuditLog, countAuditLog, resolveAuditPath, tailAuditLog } from "../lib/audit.ts";
 
 /** Current config. Loaded on session_start, mutated by /vision, saved to disk. */
 let config: VisionConfig = { ...DEFAULT_CONFIG };
@@ -88,6 +90,9 @@ const SUBCOMMANDS = [
   "auto-prompt",
   "preview",
   "batch-concurrency",
+  "local-only",
+  "audit",
+  "audit-path",
 ] as const;
 
 function formatConfigStatus(c: VisionConfig): string {
@@ -110,6 +115,9 @@ function formatConfigStatus(c: VisionConfig): string {
     `  composePreview:  ${c.composePreview}`,
     `  previewMaxWidth: ${c.previewMaxWidthCells} cells`,
     `  batchConcurrency: ${c.batchConcurrency}`,
+    `  localOnly:       ${c.localOnly ? "on" : "off"}`,
+    `  auditLog:        ${c.auditLog ? "on" : "off"}`,
+    `  autoDetect:      ${c.autoDetectVisionModel ? "on" : "off"}`,
   ].join("\n");
 }
 
@@ -160,6 +168,12 @@ function renderValue(id: string): string {
       return `${config.previewMaxWidthCells}`;
     case "batchConcurrency":
       return `${config.batchConcurrency}`;
+    case "localOnly":
+      return config.localOnly ? "on" : "off";
+    case "auditLog":
+      return config.auditLog ? "on" : "off";
+    case "autoDetectVisionModel":
+      return config.autoDetectVisionModel ? "on" : "off";
     default:
       return "";
   }
@@ -358,6 +372,28 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
         values: ["1", "3", "5", "10", "20"],
         description: "Max parallel image delegations in a batch (describe_image image_paths + paste auto mode). 1 = serial; 20 = aggressive (rate-limit risk).",
       },
+      // ── v0.5.0 (SPEC-5) rows ──────────────────────────────────────────
+      {
+        id: "localOnly",
+        label: "Local-only mode",
+        currentValue: renderValue("localOnly"),
+        values: ["on", "off"],
+        description: "When on, image bytes never leave the machine. Cache hits still work (local); a cache miss refuses with a clear error instead of a network call. Structural guarantee (no network).",
+      },
+      {
+        id: "auditLog",
+        label: "Audit log",
+        currentValue: renderValue("auditLog"),
+        values: ["on", "off"],
+        description: `When on, every delegation is appended to ${resolveAuditPath(config.auditLogPath, getAgentDir())} (JSONL: provider/model/cached/fallback/ok/error_code). Never logs image bytes or the prompt.`,
+      },
+      {
+        id: "autoDetectVisionModel",
+        label: "Auto-detect vision model",
+        currentValue: renderValue("autoDetectVisionModel"),
+        values: ["on", "off"],
+        description: "When on + provider/model unset, auto-detect the vision model at session_start (prefers Ollama Cloud primary + a frontier fallback). Persists once; /vision clear re-triggers.",
+      },
     ];
 
     const settingsList = new SettingsList(
@@ -489,6 +525,37 @@ export default function visionExtension(pi: ExtensionAPI): void {
   // ── Session lifecycle ───────────────────────────────────────────────────
   pi.on("session_start", (_event, ctx) => {
     config = loadConfig(getAgentDir());
+
+    // ── Auto-detect workflow-fit defaults (SPEC-5 §3.3) ───────────────
+    // Fires only when BOTH provider + model are unset (fresh config). A
+    // partial config (one set, one blank) is the user mid-configuration —
+    // don't overwrite. The detected values are persisted once (the user sees
+    // them + can override; /vision clear re-triggers). Prefers the Ollama
+    // provider's vision models (AGENTS.md "Ollama Cloud primary") + a
+    // frontier fallback (first non-Ollama vision model).
+    if (config.autoDetectVisionModel && !config.provider && !config.model && typeof ctx.modelRegistry?.getAvailable === "function") {
+      const detected = autoDetectDefaults(ctx.modelRegistry.getAvailable());
+      if (detected.provider && detected.model) {
+        config = {
+          ...config,
+          provider: detected.provider,
+          model: detected.model,
+          // Only set the fallback if the user hadn't set one (don't override
+          // an explicit unset-ness the user may want — SPEC-5 §9.5).
+          ...(config.fallbackProvider || config.fallbackModel
+            ? {}
+            : { fallbackProvider: detected.fallbackProvider, fallbackModel: detected.fallbackModel }),
+        };
+        saveConfig(config, getAgentDir());
+        ctx.ui.notify(
+          `Vision: auto-configured ${detected.provider}/${detected.model}` +
+            (detected.fallbackModel ? ` (+ fallback ${detected.fallbackProvider}/${detected.fallbackModel})` : "") +
+            `. /vision to change.`,
+          "info",
+        );
+      }
+    }
+
     rebuildCache();
     setSharedState(config, cache);
     syncToolAvailability(pi, ctx.model, { enabled: config.enabled });
@@ -914,6 +981,80 @@ export default function visionExtension(pi: ExtensionAPI): void {
           saveConfig(config, agentDir);
           setSharedState(config, cache);
           ctx.ui.notify(`Batch concurrency set to ${config.batchConcurrency}.`, "info");
+          return;
+        }
+        case "local-only": {
+          const value = parts[1];
+          if (!value) {
+            ctx.ui.notify(
+              `Local-only mode: ${config.localOnly ? "on" : "off"}. ` +
+                "When on, image bytes never leave the machine (cache hits still work; a cache miss refuses with a clear error instead of a network call). " +
+                "Toggle via /vision local-only on|off.",
+              "info",
+            );
+            return;
+          }
+          if (value !== "on" && value !== "off") {
+            ctx.ui.notify("Usage: /vision local-only <on|off>", "warning");
+            return;
+          }
+          config = applySettingChange(config, "localOnly", value);
+          saveConfig(config, agentDir);
+          setSharedState(config, cache);
+          ctx.ui.notify(`Local-only mode ${config.localOnly ? "enabled" : "disabled"}.`, "info");
+          return;
+        }
+        case "audit": {
+          const action = parts[1];
+          const path = resolveAuditPath(config.auditLogPath, agentDir);
+          if (action === "clear") {
+            clearAuditLog(path);
+            ctx.ui.notify(`Audit log cleared (${path}).`, "info");
+            return;
+          }
+          if (action === "show") {
+            const entries = tailAuditLog(path, 10);
+            const total = countAuditLog(path);
+            const lines = entries.map((e) =>
+              `[${e.ts}] ${e.provider}/${e.model} ${e.cached ? "(cached)" : e.fallback ? "(fallback)" : ""} ok=${e.ok}${e.error_code ? ` err=${e.error_code}` : ""}${e.local_only ? " local-only" : ""} ${e.latency_ms}ms ${e.image_path}`,
+            );
+            ctx.ui.notify(
+              `Audit log (${path}) - ${total} entries, last 10:\n${lines.join("\n") || "(empty)"}`,
+              "info",
+            );
+            return;
+          }
+          if (action === "path") {
+            ctx.ui.notify(`Audit log path: ${path}`, "info");
+            return;
+          }
+          if (action === "on" || action === "off") {
+            config = applySettingChange(config, "auditLog", action);
+            saveConfig(config, agentDir);
+            setSharedState(config, cache);
+            ctx.ui.notify(`Audit logging ${config.auditLog ? "on" : "off"} (${path}).`, "info");
+            return;
+          }
+          ctx.ui.notify("Usage: /vision audit <clear|show|path|on|off>", "warning");
+          return;
+        }
+        case "audit-path": {
+          const value = parts.slice(1).join(" ").trim();
+          if (!value) {
+            ctx.ui.notify(`Audit log path: ${resolveAuditPath(config.auditLogPath, agentDir)}${config.auditLogPath ? " (custom)" : " (default)"}`, "info");
+            return;
+          }
+          if (value === "clear") {
+            config = applySettingChange(config, "auditLogPath", "clear");
+          } else {
+            config = applySettingChange(config, "auditLogPath", value);
+          }
+          saveConfig(config, agentDir);
+          setSharedState(config, cache);
+          ctx.ui.notify(
+            `Audit log path set to ${resolveAuditPath(config.auditLogPath, agentDir)}.`,
+            "info",
+          );
           return;
         }
         default: {

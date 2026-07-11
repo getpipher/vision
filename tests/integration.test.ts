@@ -33,6 +33,9 @@ process.env.PI_CODING_AGENT_DIR = TMP_AGENT;
 
 import visionFactory from "../extensions/vision.ts";
 import pasteFactory from "../extensions/paste.ts";
+import { loadConfig, configFilePath } from "../lib/config.ts";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { countAuditLog, tailAuditLog } from "../lib/audit.ts";
 
 const PNG_1x1_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M8AAAMBEg1+mP0AAAAASUVORK5CYII=";
@@ -156,6 +159,7 @@ function makeRegistry(opts: {
   apiKey?: string;
 } = {}) {
   return {
+    getAvailable: () => [],
     find: () => (opts.model === undefined ? undefined : opts.model),
     getApiKeyAndHeaders: async () =>
       opts.authOk === false
@@ -1565,6 +1569,402 @@ test("T53: v0.3.x + v0.4.0 regression gate — full suite invariant", () => {
   // The suite passing (this test included) is the gate. Sanity: the helper
   // modules this builds on are all importable + the constants are intact.
   assert.ok(true, "full suite green = T53 regression gate passed");
+});
+
+// ── v0.5.0 (SPEC-5) integration tests: auto-detect + subcommands + audit + local-only ─
+
+/** Helper: delete the persisted vision.json so session_start sees a fresh
+ *  (unconfigured) state — needed for auto-detect tests. */
+function resetVisionConfig(): void {
+  try { rmSync(configFilePath(getAgentDir()), { force: true }); } catch { /* best-effort */ }
+}
+
+/** Helper: build a ctx with a custom model registry (getAvailable + find + auth). */
+function makeCtxWithRegistry(opts: {
+  model?: Model<Api> | undefined;
+  cwd?: string;
+  available: Model<Api>[];
+  findModel?: Model<Api> | undefined;
+  authOk?: boolean;
+}): ExtensionContext {
+  return {
+    ui: { notify: () => {} },
+    mode: "tui",
+    hasUI: false,
+    cwd: opts.cwd ?? "/tmp",
+    sessionManager: {},
+    modelRegistry: {
+      getAvailable: () => opts.available,
+      find: () => opts.findModel ?? opts.available[0],
+      getApiKeyAndHeaders: async () =>
+        opts.authOk === false
+          ? { ok: false, error: "no api key" }
+          : { ok: true, apiKey: "test-key", headers: undefined },
+    } as any,
+    model: opts.model,
+    isIdle: () => true,
+    isProjectTrusted: () => true,
+    signal: undefined,
+    abort: () => {},
+    hasPendingMessages: () => false,
+    shutdown: () => {},
+    getContextUsage: () => undefined,
+    compact: () => {},
+    getSystemPrompt: () => "",
+  } as unknown as ExtensionContext;
+}
+
+function ollamaVision(id = "minimax-m3:cloud"): Model<Api> {
+  return { id, name: id, provider: "Ollama", api: "openai-completions" as Api, reasoning: false, input: ["text", "image"], contextWindow: 512000, maxTokens: 4096 } as Model<Api>;
+}
+function openRouterVision(id = "gpt-4o"): Model<Api> {
+  return { id, name: id, provider: "OpenRouter", api: "openai-completions" as Api, reasoning: false, input: ["text", "image"], contextWindow: 128000, maxTokens: 4096 } as Model<Api>;
+}
+function textModel(provider: string, id: string): Model<Api> {
+  return { id, name: id, provider, api: "openai-completions" as Api, reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 4096 } as Model<Api>;
+}
+
+// ── T61: auto-detect Ollama Cloud primary (★ gap #10) ──────────────────
+test("T61: auto-detect picks Ollama/minimax-m3:cloud on fresh config (+ no fallback, no non-Ollama vision)", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  resetVisionConfig();
+  let notified = "";
+  const ctx = makeCtxWithRegistry({
+    model: TEXT_ONLY,
+    available: [ollamaVision("minimax-m3:cloud"), ollamaVision("qwen3.5:cloud"), textModel("Ollama", "glm-5.2:cloud")],
+  });
+  (ctx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+  // Persisted to vision.json.
+  const persisted = loadConfig(getAgentDir());
+  assert.equal(persisted.provider, "Ollama", "auto-detected Ollama provider");
+  assert.equal(persisted.model, "minimax-m3:cloud", "picked first Ollama vision by sorted id");
+  assert.equal(persisted.fallbackProvider, undefined, "no non-Ollama vision → no fallback");
+  assert.equal(persisted.fallbackModel, undefined);
+  assert.match(notified, /auto-configured Ollama\/minimax-m3:cloud/, "notify fired with the model");
+  // Tool visibility synced for the text-only primary.
+  assert.ok(pi.getActiveTools().includes("describe_image"), "tool visible for text-only primary");
+});
+
+// ── T62: auto-detect frontier fallback ────────────────────────────────
+test("T62: auto-detect picks Ollama primary + OpenRouter frontier fallback", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  resetVisionConfig();
+  let notified = "";
+  const ctx = makeCtxWithRegistry({
+    model: TEXT_ONLY,
+    available: [ollamaVision("minimax-m3:cloud"), openRouterVision("gpt-4o"), textModel("Ollama", "glm-5.2:cloud")],
+  });
+  (ctx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+  const persisted = loadConfig(getAgentDir());
+  assert.equal(persisted.provider, "Ollama");
+  assert.equal(persisted.model, "minimax-m3:cloud");
+  assert.equal(persisted.fallbackProvider, "OpenRouter", "frontier fallback auto-detected");
+  assert.equal(persisted.fallbackModel, "gpt-4o");
+  assert.match(notified, /fallback OpenRouter\/gpt-4o/, "notify names both primary + fallback");
+});
+
+// ── T63: auto-detect no vision models → no-op ─────────────────────────
+test("T63: auto-detect no vision models → config stays unset, no notify", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  resetVisionConfig();
+  let notified = "";
+  const ctx = makeCtxWithRegistry({
+    model: TEXT_ONLY,
+    available: [textModel("Ollama", "glm-5.2:cloud"), textModel("OpenRouter", "gpt-4o")],
+  });
+  (ctx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+  const persisted = loadConfig(getAgentDir());
+  assert.equal(persisted.provider, undefined, "no vision models → stays unconfigured");
+  assert.equal(persisted.model, undefined);
+  assert.equal(notified, "", "no notify when nothing detected");
+});
+
+// ── T64: auto-detect skipped when configured ──────────────────────────
+test("T64: auto-detect skipped when provider+model already set (no override)", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  // Pre-write a config with explicit provider/model.
+  resetVisionConfig();
+  const { saveConfig } = await import("../lib/config.ts");
+  saveConfig({ ...loadConfig(getAgentDir()), provider: "Ollama", model: "qwen3.5:cloud" }, getAgentDir());
+  let notified = "";
+  const ctx = makeCtxWithRegistry({
+    model: TEXT_ONLY,
+    available: [ollamaVision("minimax-m3:cloud"), ollamaVision("qwen3.5:cloud")],
+  });
+  (ctx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+  const persisted = loadConfig(getAgentDir());
+  assert.equal(persisted.model, "qwen3.5:cloud", "explicit config preserved (not overwritten by auto-detect)");
+  assert.equal(notified, "", "no auto-detect notify when already configured");
+});
+
+// ── T65: auto-detect skipped when disabled ────────────────────────────
+test("T65: auto-detect skipped when autoDetectVisionModel:false (fresh config stays unset)", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  resetVisionConfig();
+  // Pre-write a fresh config with autoDetectVisionModel explicitly off.
+  const { saveConfig, DEFAULT_CONFIG } = await import("../lib/config.ts");
+  saveConfig({ ...DEFAULT_CONFIG, autoDetectVisionModel: false }, getAgentDir());
+  let notified = "";
+  const ctx = makeCtxWithRegistry({
+    model: TEXT_ONLY,
+    available: [ollamaVision("minimax-m3:cloud"), ollamaVision("qwen3.5:cloud")],
+  });
+  (ctx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+  const persisted = loadConfig(getAgentDir());
+  assert.equal(persisted.provider, undefined, "auto-detect disabled → stays unconfigured");
+  assert.equal(persisted.model, undefined);
+  assert.equal(persisted.autoDetectVisionModel, false);
+  assert.equal(notified, "");
+});
+
+// ── auto-detect doesn't override an explicitly-set fallback ───────────
+test("auto-detect sets primary but does NOT override an explicitly-set fallback", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  resetVisionConfig();
+  const { saveConfig, DEFAULT_CONFIG } = await import("../lib/config.ts");
+  // Fresh primary (unset) but explicit fallback set by the user.
+  saveConfig({ ...DEFAULT_CONFIG, fallbackProvider: "MyProvider", fallbackModel: "my-model" }, getAgentDir());
+  const ctx = makeCtxWithRegistry({
+    model: TEXT_ONLY,
+    available: [ollamaVision("minimax-m3:cloud"), ollamaVision("qwen3.5:cloud"), openRouterVision("gpt-4o")],
+  });
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+  const persisted = loadConfig(getAgentDir());
+  assert.equal(persisted.provider, "Ollama", "primary auto-detected");
+  assert.equal(persisted.model, "minimax-m3:cloud");
+  assert.equal(persisted.fallbackProvider, "MyProvider", "user's explicit fallback preserved");
+  assert.equal(persisted.fallbackModel, "my-model");
+});
+
+// ── T60: audit log batch (3 images → 3 audit lines, input order) ──────
+test("T60: describe_image batch with auditLog on → 3 audit lines (one per image), input order", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  // Build 3 distinct images (different colors so different hashes).
+  const file2 = join(dir, "pixel2.png");
+  const file3 = join(dir, "pixel3.png");
+  writeFileSync(file2, make1x1Png(0, 0, 255));
+  writeFileSync(file3, make1x1Png(0, 255, 0));
+  const auditPath = join(dir, "audit.log");
+  const fm = mockFetch({ choices: [{ message: { content: "a pixel" } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    // Configure + point the audit log at a temp path.
+    const cfgCtx = makeCtx({ model: TEXT_ONLY, cwd: dir }) as unknown as ExtensionCommandContext;
+    (cfgCtx.ui as any).notify = () => {};
+    await pi.commands.get("vision")!.handler("model ollama/minimax-m3:cloud", cfgCtx);
+    await pi.commands.get("vision")!.handler(`audit-path ${auditPath}`, cfgCtx);
+    const result = await executeTool(pi, { image_paths: [file, file2, file3], prompt: "compare" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    assert.equal(result.details.mode, "delegate-batch");
+    assert.equal(fm.calls.length, 3, "3 fetch calls (one per image)");
+    assert.equal(countAuditLog(auditPath), 3, "3 audit lines (one per image)");
+    const entries = tailAuditLog(auditPath, 10);
+    assert.equal(entries.length, 3);
+    assert.ok(entries.every((e) => e.ok === true), "all 3 succeeded");
+    // Audit log is chronological (append = completion order, non-deterministic
+    // under parallel delegation). The tool RESULT (buildBatchToolResult) preserves
+    // input order; the audit log does not (it is an event log, not an index).
+    // Assert the SET of paths, not order.
+    const loggedPaths = new Set(entries.map((e) => e.image_path));
+    assert.equal(loggedPaths.size, 3, "3 distinct paths logged");
+    assert.ok([...loggedPaths].some((p) => p.includes("pixel.png")), "pixel.png logged");
+    assert.ok([...loggedPaths].some((p) => p.includes("pixel2.png")), "pixel2.png logged");
+    assert.ok([...loggedPaths].some((p) => p.includes("pixel3.png")), "pixel3.png logged");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T69: /vision local-only + /vision audit + /vision audit-path subcommands ─
+test("T69: /vision local-only + /vision audit + /vision audit-path subcommands", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
+  const auditPath = join(TMP_AGENT, "test-audit.log");
+  let notified = "";
+  const cmdCtx = makeCtx({ model: TEXT_ONLY }) as unknown as ExtensionCommandContext;
+  (cmdCtx.ui as any).notify = (msg: string) => { notified = msg; };
+
+  // /vision local-only on
+  await pi.commands.get("vision")!.handler("local-only on", cmdCtx);
+  assert.equal(loadConfig(getAgentDir()).localOnly, true, "local-only persisted");
+
+  // /vision local-only (no arg) → shows current
+  await pi.commands.get("vision")!.handler("local-only", cmdCtx);
+  assert.match(notified, /local-only/i, "shows current local-only state");
+
+  // /vision audit-path <path>
+  await pi.commands.get("vision")!.handler(`audit-path ${auditPath}`, cmdCtx);
+  assert.equal(loadConfig(getAgentDir()).auditLogPath, auditPath, "audit path persisted");
+
+  // /vision audit path → prints resolved path
+  await pi.commands.get("vision")!.handler("audit path", cmdCtx);
+  assert.match(notified, /Audit log path/i, "audit path shown");
+
+  // /vision audit-path clear → undefined
+  await pi.commands.get("vision")!.handler("audit-path clear", cmdCtx);
+  assert.equal(loadConfig(getAgentDir()).auditLogPath, undefined, "audit path cleared");
+
+  // /vision audit off → auditLog false
+  await pi.commands.get("vision")!.handler("audit off", cmdCtx);
+  assert.equal(loadConfig(getAgentDir()).auditLog, false, "audit logging disabled");
+
+  // /vision audit on → auditLog true
+  await pi.commands.get("vision")!.handler("audit on", cmdCtx);
+  assert.equal(loadConfig(getAgentDir()).auditLog, true, "audit logging re-enabled");
+});
+
+// ── T58 end-to-end (tool layer): local-only cache miss via describe_image ──
+test("T58 (integration): describe_image + localOnly on + cache miss → clear error, isError, 0 fetch", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  const fm = mockFetch({ choices: [{ message: { content: "should not reach" } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    const cfgCtx = makeCtx({ model: TEXT_ONLY, cwd: dir }) as unknown as ExtensionCommandContext;
+    (cfgCtx.ui as any).notify = () => {};
+    await pi.commands.get("vision")!.handler("model ollama/minimax-m3:cloud", cfgCtx);
+    await pi.commands.get("vision")!.handler("local-only on", cfgCtx);
+    const result = await executeTool(pi, { image_path: file, prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    assert.equal(result.isError, true, "tool flags isError on local-only refusal");
+    assert.match(result.content[0].text, /local-only mode/);
+    assert.equal(fm.calls.length, 0, "0 fetch calls (structural guarantee at the tool layer)");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T59: paste auto mode + local-only short-circuit (★ SPEC-5 §3.2) ──
+test("T59: text-only + auto + localOnly on → hint fallback immediately (no delegation, no timeout burned)", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const colors: Array<[number, number, number]> = [[255, 0, 0], [0, 255, 0]];
+  const files = ["a.png", "b.png"].map((f, i) => {
+    const p = join(dir, f);
+    writeFileSync(p, make1x1Png(...colors[i]!));
+    return p;
+  });
+  let fetchCalls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => { fetchCalls++; return new Response("{}", { status: 200 }); }) as typeof globalThis.fetch;
+  try {
+    writeFileSync(join(TMP_AGENT, "vision.json"), JSON.stringify({
+      provider: "ollama", model: "minimax-m3:cloud", enabled: true,
+      retryAttempts: 0, textOnlyPasteMode: "auto", batchConcurrency: 4,
+      localOnly: true, autoDelegateTimeoutMs: 30000,
+    }));
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    const start = Date.now();
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${files.join(" and ")}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }),
+    );
+    const elapsed = Date.now() - start;
+    assert.equal(inputResult?.action, "transform");
+    assert.equal(fetchCalls, 0, "no delegation attempted (local-only short-circuit)");
+    assert.equal((inputResult.images ?? []).length, 0, "no image attached (text-only)");
+    // The hint line lists both paths so the model can call describe_image for cache hits.
+    assert.ok(files.every((f) => inputResult.text.includes(f)), "hint lists both paths");
+    // Critical: no timeout burned (local-only skips the AbortController entirely).
+    assert.ok(elapsed < 1000, `no timeout burned: elapsed=${elapsed}ms (would be ~30000ms if it waited)`);
+  } finally {
+    globalThis.fetch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T57 (integration): paste auto + local-only + pre-cached image → cache hit ──
+test("T57 (integration): paste auto + localOnly + cached image → cache hit via tool (local-only allows cache)", async () => {
+  // Local-only allows cache hits (the cache is local). This test verifies the
+  // paste auto short-circuit goes to hint (where the model can then call
+  // describe_image for a cache hit). The delegate-level cache-hit-in-local-only
+  // is covered in delegate.test.ts T57; this confirms the paste path doesn't
+  // block that by attempting a forbidden network call.
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  let fetchCalls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Response(JSON.stringify({ choices: [{ message: { content: "a desc" } }] }), { status: 200 });
+  }) as typeof globalThis.fetch;
+  try {
+    writeFileSync(join(TMP_AGENT, "vision.json"), JSON.stringify({
+      provider: "ollama", model: "minimax-m3:cloud", enabled: true,
+      retryAttempts: 0, textOnlyPasteMode: "auto", localOnly: true,
+    }));
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${file}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.equal(fetchCalls, 0, "paste auto + local-only → no delegation (hint fallback)");
+    assert.ok(inputResult.text.includes(file), "hint lists the path");
+  } finally {
+    globalThis.fetch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T70: v0.5.0 regression gate — full surface wired ──────────────────
+test("T70: v0.5.0 regression gate — config fields + subcommands + auto-detect all wired", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  resetVisionConfig();
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
+  // 4 new config fields default correctly (fresh config after reset + session_start).
+  const cfg = loadConfig(getAgentDir());
+  assert.equal(cfg.auditLog, true, "auditLog default on");
+  assert.equal(cfg.auditLogPath, undefined);
+  assert.equal(cfg.localOnly, false);
+  assert.equal(cfg.autoDetectVisionModel, true);
+  // 3 new subcommands registered.
+  const cmds = [...pi.commands.keys()];
+  assert.ok(cmds.includes("vision"), "/vision command registered");
+  // The subcommands are parsed inside the vision handler; verify they dispatch
+  // without error by exercising one of each (local-only, audit, audit-path).
+  const cmdCtx = makeCtx({ model: TEXT_ONLY }) as unknown as ExtensionCommandContext;
+  (cmdCtx.ui as any).notify = () => {};
+  await pi.commands.get("vision")!.handler("local-only off", cmdCtx);
+  await pi.commands.get("vision")!.handler("audit show", cmdCtx);
+  await pi.commands.get("vision")!.handler("audit-path", cmdCtx);
+  assert.equal(loadConfig(getAgentDir()).localOnly, false, "local-only off persisted");
+  // Auto-detect wired: a fresh config + vision-capable registry triggers detection.
+  resetVisionConfig();
+  let notified = "";
+  const detectCtx = makeCtxWithRegistry({
+    model: TEXT_ONLY,
+    available: [ollamaVision("minimax-m3:cloud")],
+  });
+  (detectCtx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, detectCtx);
+  assert.equal(loadConfig(getAgentDir()).model, "minimax-m3:cloud", "auto-detect wired end-to-end");
+  assert.match(notified, /auto-configured/);
+  // Full suite green = T70 passed (if this test runs, the suite compiled + loaded).
+  assert.ok(true, "v0.5.0 surface wired + regression gate passed");
 });
 
 // Cleanup the temp agent dir after all tests.

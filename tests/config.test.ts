@@ -42,6 +42,10 @@ test("DEFAULT_CONFIG has the expected shape", () => {
     composePreview: true,
     previewMaxWidthCells: 80,
     batchConcurrency: 5,
+    auditLog: true,
+    auditLogPath: undefined,
+    localOnly: false,
+    autoDetectVisionModel: true,
   });
 });
 
@@ -488,4 +492,85 @@ test("mergeConfig: v0.3.x config loads with batchConcurrency default (forward-co
   });
   assert.equal(v03.batchConcurrency, 5, "v0.3.x config gets v0.4.0 default");
   assert.equal(v03.markerStyle, "bold");
+});
+
+// ── v0.5.0 (SPEC-5) fields: auditLog, auditLogPath, localOnly, autoDetectVisionModel ──
+
+test("mergeConfig: v0.5.0 defaults — auditLog true, auditLogPath undefined, localOnly false, autoDetectVisionModel true", () => {
+  const c = mergeConfig({});
+  assert.equal(c.auditLog, true, "audit log on by default (opt-out security posture)");
+  assert.equal(c.auditLogPath, undefined);
+  assert.equal(c.localOnly, false);
+  assert.equal(c.autoDetectVisionModel, true);
+});
+
+test("mergeConfig: v0.5.0 fields pass through + validate", () => {
+  const c = mergeConfig({
+    auditLog: false,
+    auditLogPath: "/custom/audit.log",
+    localOnly: true,
+    autoDetectVisionModel: false,
+  });
+  assert.equal(c.auditLog, false);
+  assert.equal(c.auditLogPath, "/custom/audit.log");
+  assert.equal(c.localOnly, true);
+  assert.equal(c.autoDetectVisionModel, false);
+});
+
+test("mergeConfig: empty/whitespace auditLogPath → undefined", () => {
+  assert.equal(mergeConfig({ auditLogPath: "" }).auditLogPath, undefined);
+  assert.equal(mergeConfig({ auditLogPath: "   " }).auditLogPath, undefined);
+});
+
+test("mergeConfig: auditLogPath trimmed", () => {
+  assert.equal(mergeConfig({ auditLogPath: "  /x.log  " }).auditLogPath, "/x.log");
+});
+
+test("mergeConfig: non-boolean auditLog → default true", () => {
+  assert.equal(mergeConfig({ auditLog: "true" as unknown as boolean }).auditLog, true);
+  assert.equal(mergeConfig({ auditLog: 1 as unknown as boolean }).auditLog, true);
+});
+
+test("mergeConfig: non-boolean localOnly → default false", () => {
+  assert.equal(mergeConfig({ localOnly: "true" as unknown as boolean }).localOnly, false);
+  assert.equal(mergeConfig({ localOnly: 1 as unknown as boolean }).localOnly, false);
+});
+
+test("mergeConfig: non-boolean autoDetectVisionModel → default true", () => {
+  assert.equal(mergeConfig({ autoDetectVisionModel: "yes" as unknown as boolean }).autoDetectVisionModel, true);
+});
+
+test("applySettingChange: localOnly on/off", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "localOnly", "on").localOnly, true);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "localOnly", "off").localOnly, false);
+});
+
+test("applySettingChange: auditLog on/off", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "auditLog", "off").auditLog, false);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "auditLog", "on").auditLog, true);
+});
+
+test("applySettingChange: autoDetectVisionModel on/off", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDetectVisionModel", "off").autoDetectVisionModel, false);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDetectVisionModel", "on").autoDetectVisionModel, true);
+});
+
+test("applySettingChange: auditLogPath set + clear", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "auditLogPath", "/tmp/x.log").auditLogPath, "/tmp/x.log");
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "auditLogPath", "clear").auditLogPath, undefined);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "auditLogPath", "").auditLogPath, undefined);
+});
+
+test("mergeConfig: v0.4.0 18-field config loads with v0.5.0 defaults (forward-compat)", () => {
+  const v04 = mergeConfig({
+    provider: "ollama",
+    model: "minimax-m3:cloud",
+    batchConcurrency: 10,
+    // no v0.5.0 fields
+  });
+  assert.equal(v04.batchConcurrency, 10, "v0.4.0 field preserved");
+  assert.equal(v04.auditLog, true, "v0.5.0 default applied");
+  assert.equal(v04.auditLogPath, undefined);
+  assert.equal(v04.localOnly, false);
+  assert.equal(v04.autoDetectVisionModel, true);
 });

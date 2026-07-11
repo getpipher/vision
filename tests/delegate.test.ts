@@ -618,3 +618,266 @@ test("delegateToVisionModel: abort → code 'aborted', 0 calls, no fallback", as
     rmSync(dir, { recursive: true, force: true });
   }
 });
+// ── v0.5.0 (SPEC-5) tests: audit log + local-only mode ───────────────────
+
+import { readFileSync, existsSync, mkdirSync } from "node:fs";
+import { countAuditLog, tailAuditLog, clearAuditLog } from "../lib/audit.ts";
+
+/** Helper: a temp dir + an image file + a configured ctx + an audit log path. */
+function setupAuditTest() {
+  const dir = mkdtempSync(join(tmpdir(), "vision-delegate-audit-"));
+  const file = join(dir, "pixel.png");
+  writeFileSync(file, PNG_BYTES);
+  const auditPath = join(dir, "audit.log");
+  const ctx = makeCtx({ cwd: dir });
+  const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", auditLog: true, auditLogPath: auditPath };
+  return { dir, file, auditPath, ctx, cfg };
+}
+
+test("T54: audit log basic — success → one JSONL line with full routing trace, no bytes", async () => {
+  const { dir, file, auditPath, ctx, cfg } = setupAuditTest();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "a desc" } }] } });
+  try {
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "describe", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true);
+    assert.equal(countAuditLog(auditPath), 1, "one audit line");
+    const lines = readFileSync(auditPath, "utf8").split("\n").filter((l) => l.trim().length > 0);
+    const entry = JSON.parse(lines[0]!);
+    assert.equal(entry.provider, "ollama");
+    assert.equal(entry.model, "ollama/minimax-m3:cloud");
+    assert.equal(entry.image_path, file, "file path logged in full");
+    assert.equal(entry.cached, false);
+    assert.equal(entry.fallback, false);
+    assert.equal(entry.ok, true);
+    assert.equal(entry.error_code, undefined);
+    assert.equal(entry.local_only, false);
+    assert.ok(entry.latency_ms >= 0, "latency measured");
+    assert.ok(typeof entry.source_hash === "string" && entry.source_hash.length > 0, "source hash present");
+    // Privacy: the raw image bytes must NOT appear in the log line.
+    assert.ok(!lines[0]!.includes(PNG_1x1_B64), "no image bytes in audit log");
+    assert.equal(m.calls.length, 1, "one fetch");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T55: audit log cache hit → second line cached:true, ok:true, latency_ms:0, fetch not called", async () => {
+  const { dir, file, auditPath, ctx, cfg } = setupAuditTest();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "a desc" } }] } });
+  try {
+    const cache = new VisionCache(undefined, 256);
+    const params = { image_path: file, prompt: "describe", compress: false, reasoning: "off" as const };
+    await delegateToVisionModel(ctx, cfg, params, undefined, cache); // miss → fetch
+    await delegateToVisionModel(ctx, cfg, params, undefined, cache); // hit → no fetch
+    assert.equal(countAuditLog(auditPath), 2, "two audit lines");
+    const lines = readFileSync(auditPath, "utf8").split("\n").filter((l) => l.trim().length > 0);
+    const hitEntry = JSON.parse(lines[1]!);
+    assert.equal(hitEntry.cached, true);
+    assert.equal(hitEntry.ok, true);
+    assert.equal(hitEntry.latency_ms, 0, "cache hit = 0 latency");
+    assert.equal(hitEntry.local_only, false);
+    assert.equal(m.calls.length, 1, "second call = 0 vision-model calls");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T56: audit log fallback success → fallback:true, fallback_model set; then both fail → error_code", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "vision-delegate-audit-"));
+  const file = join(dir, "pixel.png");
+  writeFileSync(file, PNG_BYTES);
+  const auditPath = join(dir, "audit.log");
+  const ctx = makeCtx({ cwd: dir });
+  const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", fallbackProvider: "openrouter", fallbackModel: "gpt-4o", auditLog: true, auditLogPath: auditPath, retryAttempts: 0, retryBackoffMs: 1 };
+  // Primary fails (500), fallback succeeds (200).
+  const m = mockFetchSeq([
+    { status: 500, body: { error: "boom" } },
+    { status: 200, body: { choices: [{ message: { content: "fallback desc" } }] } },
+  ]);
+  try {
+    const r1 = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r1.ok, true, "fallback succeeds");
+    if (r1.ok) assert.equal(r1.details.fallback, true);
+    assert.equal(countAuditLog(auditPath), 1);
+    const e1 = JSON.parse(readFileSync(auditPath, "utf8").split("\n").filter((l) => l.trim())[0]!);
+    assert.equal(e1.fallback, true);
+    assert.equal(e1.ok, true);
+    assert.equal(e1.fallback_model, "openrouter/gpt-4o", "fallback model recorded");
+    // provider = configured primary (the attempted route), per PLAN-5 §1.6.
+    assert.equal(e1.provider, "ollama");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // Now: both primary + fallback fail.
+  const dir2 = mkdtempSync(join(tmpdir(), "vision-delegate-audit-"));
+  const file2 = join(dir2, "pixel.png");
+  writeFileSync(file2, PNG_BYTES);
+  const auditPath2 = join(dir2, "audit.log");
+  const ctx2 = makeCtx({ cwd: dir2 });
+  const cfg2 = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", fallbackProvider: "openrouter", fallbackModel: "gpt-4o", auditLog: true, auditLogPath: auditPath2, retryAttempts: 0, retryBackoffMs: 1 };
+  const m2 = mockFetchSeq([
+    { status: 500, body: { error: "primary boom" } },
+    { status: 500, body: { error: "fallback boom" } },
+  ]);
+  try {
+    const r2 = await delegateToVisionModel(ctx2, cfg2, { image_path: file2, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r2.ok, false, "both fail");
+    assert.equal(countAuditLog(auditPath2), 1);
+    const e2 = JSON.parse(readFileSync(auditPath2, "utf8").split("\n").filter((l) => l.trim())[0]!);
+    assert.equal(e2.ok, false);
+    assert.equal(e2.error_code, "vision_call_error");
+  } finally {
+    m2.restore();
+    rmSync(dir2, { recursive: true, force: true });
+  }
+});
+
+test("T57: local-only cache hit → returns cached desc, fetch NOT called, local_only:true", async () => {
+  const { dir, file, auditPath, ctx, cfg } = setupAuditTest();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "cached desc" } }] } });
+  try {
+    const cache = new VisionCache(undefined, 256);
+    const params = { image_path: file, prompt: "describe", compress: false, reasoning: "off" as const };
+    // Prime the cache with localOnly OFF.
+    const cfgNormal = { ...cfg, localOnly: false };
+    await delegateToVisionModel(ctx, cfgNormal, params, undefined, cache);
+    assert.equal(m.calls.length, 1, "primed cache with one fetch");
+    // Now: localOnly ON, same image → cache hit, no new fetch.
+    clearAuditLog(auditPath);
+    const cfgLocal = { ...cfg, localOnly: true };
+    const r = await delegateToVisionModel(ctx, cfgLocal, params, undefined, cache);
+    assert.equal(r.ok, true, "cache hit returns desc");
+    if (r.ok) assert.equal(r.text, "cached desc");
+    assert.equal(m.calls.length, 1, "fetch NOT called again (cache hit in local-only)");
+    // Audit: cached:true, local_only:true, ok:true.
+    assert.equal(countAuditLog(auditPath), 1);
+    const entry = JSON.parse(readFileSync(auditPath, "utf8").split("\n").filter((l) => l.trim())[0]!);
+    assert.equal(entry.cached, true);
+    assert.equal(entry.local_only, true);
+    assert.equal(entry.ok, true);
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T58: local-only cache miss → clear error, fetch NOT called (structural guarantee)", async () => {
+  const { dir, file, auditPath, ctx, cfg } = setupAuditTest();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "should not reach" } }] } });
+  try {
+    const cfgLocal = { ...cfg, localOnly: true };
+    const r = await delegateToVisionModel(ctx, cfgLocal, { image_path: file, prompt: "describe", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, false, "cache miss + local-only → refusal");
+    if (!r.ok) {
+      assert.equal(r.error.code, "local_only");
+      assert.ok(r.error.message.includes("local-only mode"), "clear message");
+      assert.ok(r.error.message.includes("/vision local-only off"), "actionable: names the toggle");
+    }
+    assert.equal(m.calls.length, 0, "fetch NOT called — structural guarantee (no network)");
+    // Audit: ok:false, error_code:"local_only", local_only:true, latency_ms:0.
+    assert.equal(countAuditLog(auditPath), 1);
+    const entry = JSON.parse(readFileSync(auditPath, "utf8").split("\n").filter((l) => l.trim())[0]!);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.error_code, "local_only");
+    assert.equal(entry.local_only, true);
+    assert.equal(entry.latency_ms, 0);
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T66: audit disabled (auditLog:false) → no file I/O, delegation succeeds", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "vision-delegate-audit-"));
+  const file = join(dir, "pixel.png");
+  writeFileSync(file, PNG_BYTES);
+  const auditPath = join(dir, "audit.log");
+  const ctx = makeCtx({ cwd: dir });
+  const cfg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", auditLog: false, auditLogPath: auditPath };
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "a desc" } }] } });
+  try {
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true, "delegation still works with audit off");
+    assert.equal(existsSync(auditPath), false, "no audit file created (no I/O)");
+    assert.equal(m.calls.length, 1);
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("audit on abort → entry error_code:aborted", async () => {
+  const { dir, file, auditPath, ctx, cfg } = setupAuditTest();
+  const m = mockFetchError(500, "boom");
+  try {
+    const controller = new AbortController();
+    controller.abort();
+    const cfgRetry = { ...cfg, retryAttempts: 0, fallbackProvider: undefined, fallbackModel: undefined };
+    const r = await delegateToVisionModel(ctx, cfgRetry, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, controller.signal);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.equal(r.error.code, "aborted");
+    assert.equal(countAuditLog(auditPath), 1);
+    const entry = JSON.parse(readFileSync(auditPath, "utf8").split("\n").filter((l) => l.trim())[0]!);
+    assert.equal(entry.ok, false);
+    assert.equal(entry.error_code, "aborted");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("audit boundary: pre-flight errors (not_configured, model_not_found, auth, image-not-found) NOT audited", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "vision-delegate-audit-"));
+  const auditPath = join(dir, "audit.log");
+  try {
+    // not_configured
+    const ctx1 = makeCtx({ cwd: dir });
+    const cfgNC = { ...DEFAULT_CONFIG, auditLog: true, auditLogPath: auditPath };
+    await delegateToVisionModel(ctx1, cfgNC, { image_path: "/tmp/x.png", prompt: "p", compress: false, reasoning: "off" }, undefined);
+
+    // model_not_found (registry returns undefined)
+    const ctx2 = { cwd: dir, modelRegistry: { find: () => undefined, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }) } as unknown as ExtensionContext["modelRegistry"] } as unknown as ExtensionContext;
+    const cfgMN = { ...DEFAULT_CONFIG, provider: "ollama", model: "nope", auditLog: true, auditLogPath: auditPath };
+    await delegateToVisionModel(ctx2, cfgMN, { image_path: "/tmp/x.png", prompt: "p", compress: false, reasoning: "off" }, undefined);
+
+    // auth failure
+    const ctx3 = makeCtx({ cwd: dir, authOk: false });
+    const cfgAuth = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", auditLog: true, auditLogPath: auditPath };
+    await delegateToVisionModel(ctx3, cfgAuth, { image_path: "/tmp/x.png", prompt: "p", compress: false, reasoning: "off" }, undefined);
+
+    // image not found
+    const ctx4 = makeCtx({ cwd: dir });
+    const cfgImg = { ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud", auditLog: true, auditLogPath: auditPath };
+    await delegateToVisionModel(ctx4, cfgImg, { image_path: "/tmp/does-not-exist.png", prompt: "p", compress: false, reasoning: "off" }, undefined);
+
+    // None of these should have written an audit line (pre-flight, before image load / before routing).
+    assert.equal(countAuditLog(auditPath), 0, "pre-flight errors are NOT routing events → not audited");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T47 regression: single-image success with audit on → v0.4.0 behavior preserved + 1 audit line (additive)", async () => {
+  const { dir, file, auditPath, ctx, cfg } = setupAuditTest();
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "a desc" } }] } });
+  try {
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "describe", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.text, "a desc");
+      assert.equal(r.details.cached, false);
+      assert.equal(r.details.fallback, false);
+      assert.equal(r.details.model, "ollama/minimax-m3:cloud");
+    }
+    assert.equal(countAuditLog(auditPath), 1, "exactly one audit line (additive)");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+

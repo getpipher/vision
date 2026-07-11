@@ -89,6 +89,27 @@ export interface VisionConfig {
   /** Max number of image delegations to run in parallel (describe_image batch
    *  + paste auto mode). 1 = serial (escape hatch). 20 = aggressive. */
   batchConcurrency: number;
+  // ── v0.5.0 (SPEC-5) ──────────────────────────────────────────────────────
+  /** When true, every vision-model delegation (success, cache hit, fallback,
+   *  failure) is appended to ~/.pi/agent/vision-audit.log as one JSONL line
+   *  (provider/model/cached/fallback/ok/error_code/latency_ms/local_only).
+   *  Never logs image bytes or the full prompt (privacy stance). Default on
+   *  — the security posture is opt-out, not opt-in. */
+  auditLog: boolean;
+  /** Custom audit log path. When undefined/empty → <agentDir>/vision-audit.log.
+   *  Power-user field (set via /vision audit-path <path> or editing vision.json). */
+  auditLogPath: string | undefined;
+  /** When true, image bytes never leave the machine. Cache hits still work
+   *  (the cache is local — memory + disk under ~/.pi/agent/); a cache miss
+   *  refuses with a clear "local-only mode on" error instead of making a
+   *  network call. Paste auto mode short-circuits to hint. Structural guarantee
+   *  (the network call code path is never entered), not a polite request. */
+  localOnly: boolean;
+  /** When true + provider+model both unset, auto-detect the vision model at
+   *  session_start from models.json (preferring the Ollama provider's vision
+   *  models + a frontier fallback). The auto-detected values are persisted
+   *  once (user can override; /vision clear re-triggers). */
+  autoDetectVisionModel: boolean;
 }
 
 export const DEFAULT_CONFIG: VisionConfig = {
@@ -117,6 +138,11 @@ export const DEFAULT_CONFIG: VisionConfig = {
   previewMaxWidthCells: 80,
   // v0.4.0 defaults
   batchConcurrency: 5,
+  // v0.5.0 defaults
+  auditLog: true,
+  auditLogPath: undefined,
+  localOnly: false,
+  autoDetectVisionModel: true,
 };
 
 export const CONFIG_FILENAME = "vision.json";
@@ -183,6 +209,11 @@ export function mergeConfig(partial: unknown): VisionConfig {
     previewMaxWidthCells: clampInt(p.previewMaxWidthCells, 20, 200, DEFAULT_CONFIG.previewMaxWidthCells),
     // v0.4.0 fields
     batchConcurrency: clampInt(p.batchConcurrency, 1, 20, DEFAULT_CONFIG.batchConcurrency),
+    // v0.5.0 fields
+    auditLog: typeof p.auditLog === "boolean" ? p.auditLog : DEFAULT_CONFIG.auditLog,
+    auditLogPath: strOrUndef(p.auditLogPath),
+    localOnly: typeof p.localOnly === "boolean" ? p.localOnly : DEFAULT_CONFIG.localOnly,
+    autoDetectVisionModel: typeof p.autoDetectVisionModel === "boolean" ? p.autoDetectVisionModel : DEFAULT_CONFIG.autoDetectVisionModel,
   };
 }
 
@@ -310,6 +341,16 @@ export function applySettingChange(
       if (!Number.isFinite(n)) return config;
       return { ...config, batchConcurrency: Math.min(20, Math.max(1, n)) };
     }
+    // ── v0.5.0 fields (SPEC-5) ─────────────────────────────────────────
+    case "localOnly":
+      return { ...config, localOnly: value === "on" };
+    case "auditLog":
+      return { ...config, auditLog: value === "on" };
+    case "autoDetectVisionModel":
+      return { ...config, autoDetectVisionModel: value === "on" };
+    case "auditLogPath":
+      // "clear" or empty → undefined; otherwise the typed path (trimmed).
+      return { ...config, auditLogPath: value.trim().length > 0 && value.trim() !== "clear" ? value.trim() : undefined };
     default:
       return config;
   }

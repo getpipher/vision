@@ -86,6 +86,9 @@ model should have `"input": ["text", "image"]`. Other `/vision` subcommands:
 | `/vision auto-prompt [<text>\|clear]` | Set/clear the generic auto-delegation prompt (no arg → multi-line editor). |
 | `/vision preview <path>` | Open a full-screen TUI preview of an image (Kitty/iTerm2 graphics, text fallback on tmux). |
 | `/vision batch-concurrency [<1-20>]` | Max parallel image delegations in a batch (`describe_image image_paths` + paste auto mode). 1 = serial; 20 = aggressive. Default 5. |
+| `/vision local-only [on\|off]` | Toggle local-only mode (no arg → show current). When on, image bytes never leave the machine — cache hits still work, a cache miss refuses with a clear error instead of a network call. |
+| `/vision audit <clear\|show\|path\|on\|off>` | Audit log management. `clear` truncates; `show` tails the last 10 entries + count; `path` prints the resolved path; `on`/`off` toggle logging. Default on. |
+| `/vision audit-path [<path>\|clear]` | Set/clear a custom audit log path (power users; no arg → show current). Default `~/.pi/agent/vision-audit.log`. |
 
 Config is stored at `~/.pi/agent/vision.json` (not `vision-tool.json`, so it
 doesn't collide with the community package during transition).
@@ -220,6 +223,102 @@ existing path-token pipeline detects it, renders a `[Image-#N]` marker, and
 attaches (multimodal) or delegates (text-only) — no separate clipboard code
 path needed. Multi-image clipboard = N `ctrl+v` presses = N paths = handled
 as a batch.
+
+## Config + security (v0.5.0)
+
+v0.5.0 makes the tool **trustable** — audit where your images go, opt out of
+network delegation entirely, and get workflow-fit defaults out of the box.
+
+### Audit log
+
+Every vision-model delegation (success, cache hit, fallback, or failure) is
+recorded in a persisted, append-only JSONL log at
+`~/.pi/agent/vision-audit.log` (one line per delegation). The log answers
+*"where did each image go?"* without storing the image bytes or the full prompt.
+
+Each line is a JSON object:
+
+| Field | Meaning |
+|---|---|
+| `ts` | ISO 8601 timestamp of the delegation event |
+| `provider` | The configured primary provider (the attempted route) |
+| `model` | The model that actually responded (the fallback on a fallback success) |
+| `image_path` | The path the user passed (file paths full; data:URL/base64 truncated) |
+| `source_hash` | SHA-256 of the original image bytes (a content fingerprint — not the bytes) |
+| `cached` | `true` if served from the cache (0 network calls) |
+| `fallback` | `true` if the result came from the fallback vision model |
+| `fallback_model` | The fallback model id, if fallback was used |
+| `ok` | `true` if the delegation succeeded |
+| `error_code` | Error code on failure (`local_only`, `vision_call_error`, `aborted`, …) |
+| `latency_ms` | Round-trip latency (0 for a cache hit / local-only refusal) |
+| `local_only` | `true` if local-only mode was active |
+
+**Privacy stance:** the log records *routing* (where bytes went), never
+*content*. Image bytes are never logged (only the `source_hash` fingerprint);
+the full prompt is never logged (the conversation log already has it). A
+`data:` URL or raw base64 `image_path` is truncated to the first 64 chars + a
+size suffix. The audit log is **on by default** (opt-out, not opt-in — the
+security posture is traceability without you remembering to enable it):
+
+```
+/vision audit off        # disable logging
+/vision audit show       # tail the last 10 entries + total count
+/vision audit clear      # truncate the log
+/vision audit path       # print the resolved log path
+/vision audit-path /tmp/my-vision.log  # custom location (power users)
+```
+
+### Local-only mode
+
+When local-only mode is on, **image bytes never leave the machine**. This is a
+structural guarantee, not a polite request — the network-call code path is
+never entered. Cache hits still work (the cache is local — memory + disk under
+`~/.pi/agent`), so local-only mode is effectively "cache-only mode": previously-
+seen images get their cached descriptions, new images refuse with a clear
+error.
+
+```
+/vision local-only on    # refuse all network delegation (cache hits OK)
+/vision local-only off   # allow delegation
+```
+
+In paste auto mode + local-only, the hook skips delegation entirely and falls
+straight to the hint line (no `autoDelegateTimeoutMs` burned waiting for a
+refused call to abort). The `describe_image` tool stays visible so the model
+can still retrieve cached descriptions and report the local-only error on a
+cache miss. Every local-only event is audited with `local_only: true`
+(greppable proof: `grep '"local_only":true' ~/.pi/agent/vision-audit.log`).
+
+### Workflow-fit defaults (auto-detect)
+
+On a fresh install (or after `/vision clear`), the extension auto-detects the
+vision model at session start from `~/.pi/agent/models.json` — aligned to the
+[AGENTS.md LLM-backend policy](https://github.com/earendil-works) of "Ollama
+Cloud primary + frontier escalation":
+
+- **Primary:** prefers the `Ollama` provider's vision-capable models (the
+  `:cloud` ones — Ollama Cloud, flat-rate + private). On RECTOR's setup this
+  picks `Ollama/minimax-m3:cloud` (first by sorted id).
+- **Fallback (frontier escalation):** the first vision-capable model under a
+  *different* provider (e.g. an OpenRouter GPT-4o), if one is configured. This
+  is the "escalate to the proper frontier model for that job" path — the
+  existing fallback mechanism, auto-populated.
+- The auto-detected values are **persisted once** to `vision.json` (you see
+  the choice + can override it). `/vision clear` resets to defaults and
+  re-triggers detection on the next session start.
+- Escape hatch: `/vision auto-detect off` (set `autoDetectVisionModel: false`)
+  disables auto-detection entirely — a fresh config stays unconfigured.
+
+Auto-detect only fires when **both** `provider` and `model` are unset (a truly
+fresh state). A partial config (one set, one blank) is you mid-configuration —
+it's not overwritten.
+
+### No config migration from pi-paster
+
+`pi-paster` is a paste-format extension — it has no configurable vision model
+(it doesn't delegate; it just marks + attaches). `@getpipher/vision`'s
+`markerStyle` (code/bold/plain) is a superset of pi-paster's fixed format, so
+there's nothing to migrate. Uninstall pi-paster, run `/vision`, done.
 
 ## How it works
 

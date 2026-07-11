@@ -376,6 +376,16 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
     const visionModel = config.provider && config.model ? `${config.provider}/${config.model}` : "(unconfigured)";
     const hintImages = loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i }));
 
+    // ── Local-only short-circuit (SPEC-5 §3.2) ────────────────────────────
+    // If local-only mode is on, every delegation would be refused (cache miss)
+    // or cache-only. Skip the batch entirely — don't burn autoDelegateTimeoutMs
+    // waiting for refused calls to abort. Fall straight to hint so the model
+    // can still call describe_image for cache hits (which local-only allows).
+    if (config.localOnly) {
+      text = `${text}\n${buildHintLine(hintImages)}`;
+      return { action: "transform" as const, text };
+    }
+
     if (!cache || !config.provider || !config.model) {
       // Can't delegate (no cache or unconfigured) → fall back to hint.
       text = `${text}\n${buildHintLine(hintImages)}`;
