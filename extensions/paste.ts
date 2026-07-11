@@ -363,7 +363,7 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
 
     if (mode === "hint") {
       // Markers + hint line nudging the model to call describe_image.
-      text = `${text}\n${buildHintLine(loaded.length)}`;
+      text = `${text}\n${buildHintLine(loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i })))}`;
       return { action: "transform" as const, text };
     }
 
@@ -373,7 +373,7 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
 
     if (!cache || !config.provider || !config.model) {
       // Can't delegate (no cache or unconfigured) → fall back to hint.
-      text = `${text}\n${buildHintLine(loaded.length)}`;
+      text = `${text}\n${buildHintLine(loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i })))}`;
       return { action: "transform" as const, text };
     }
 
@@ -393,7 +393,7 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
 
     if (allFailed) {
       // All delegations failed → hint fallback for all images.
-      text = `${text}\n${buildHintLine(loaded.length)}`;
+      text = `${text}\n${buildHintLine(loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i })))}`;
       return { action: "transform" as const, text };
     }
 
