@@ -23,6 +23,8 @@ import { isConfiguredForDelegation, type ReasoningLevel, type VisionConfig } fro
 import { loadImage, type LoadedImage } from "./image.ts";
 import { cacheKey, type VisionCache } from "./cache.ts";
 import { AbortError, classifyError, withRetry } from "./resilience.ts";
+import { appendAuditEntry, resolveAuditPath, truncateImagePathForLog, type AuditEntry } from "./audit.ts";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface DelegateParams {
   image_path: string;
@@ -182,6 +184,27 @@ const FALLBACK_MODEL_NOT_FOUND_MSG = (provider: string, model: string) =>
     "Use /vision fallback <provider/model> to update or /vision fallback clear to remove.",
   ].join("\n");
 
+/** Local-only mode refusal message (SPEC-5 §3.2). Cache hits still work; a
+ *  cache miss refuses with this clear, actionable message. */
+const LOCAL_ONLY_MSG = (cacheHint: string) =>
+  [
+    "Vision tool is in local-only mode — image bytes are not sent to any provider.",
+    "",
+    `This image has no cached description. ${cacheHint}`,
+    "",
+    "To delegate this image to a vision model:",
+    "  /vision local-only off",
+    "",
+    "To inspect the cache:",
+    "  /vision cache show",
+  ].join("\n");
+
+/** Write one audit entry (best-effort) if audit logging is enabled. */
+function audit(config: VisionConfig, entry: AuditEntry): void {
+  if (!config.auditLog) return;
+  appendAuditEntry(resolveAuditPath(config.auditLogPath, getAgentDir()), entry);
+}
+
 /**
  * Run the full DELEGATE pipeline: preflight config/auth checks → load +
  * compress the image → cache check → (retry+fallback) call the vision model
@@ -260,36 +283,83 @@ export async function delegateToVisionModel(
     reasoning: params.reasoning,
   };
 
-  // ── Cache check (hit = 0 vision-model calls) ───────────────────────────
-  if (cache && config.cacheEnabled) {
-    const key = cacheKey(
-      loaded.sourceHash,
-      params.compress,
-      config.maxDimension,
-      config.jpegQuality,
-      params.prompt,
-      modelId,
-      params.reasoning,
-    );
+  // ── Unified cache check + local-only gate + network call (SPEC-5 §1.6) ─
+  // The two v0.4.0 branches (cache-enabled-miss + no-cache) are merged into
+  // one network path so the local-only gate + the audit entry each have a
+  // single insertion point. Behavior-preserving (cache-hit + cache-store-on-
+  // success semantics identical to v0.4.0; T47 + T55 assert).
+  const useCache = !!(cache && config.cacheEnabled);
+  const key = useCache
+    ? cacheKey(loaded.sourceHash, params.compress, config.maxDimension, config.jpegQuality, params.prompt, modelId, params.reasoning)
+    : undefined;
+
+  // Cache hit (allowed in local-only — the cache is local; 0 network calls).
+  if (key && cache) {
     const hit = cache.get(key);
     if (hit) {
-      return {
-        ok: true,
-        text: hit.text,
-        details: { ...hit.details, ...baseDetails, cached: true, fallback: false },
-      };
+      audit(config, {
+        ts: new Date().toISOString(),
+        provider: config.provider ?? "(unset)",
+        model: modelId,
+        image_path: truncateImagePathForLog(params.image_path),
+        source_hash: loaded.sourceHash,
+        cached: true, fallback: false, fallback_model: undefined,
+        ok: true, error_code: undefined, latency_ms: 0, local_only: config.localOnly,
+      });
+      return { ok: true, text: hit.text, details: { ...hit.details, ...baseDetails, cached: true, fallback: false } };
     }
-    // Miss → fall through to the call; store on success (using the same key).
-    const missKey = key;
-    const result = await callWithRetryAndFallback(ctx, config, params, signal, visionModel, auth.apiKey, auth.headers, loaded.image, modelId, baseDetails);
-    if (result.ok && config.cacheEnabled) {
-      cache.set(missKey, { text: result.text, details: { ...result.details, cached: false }, storedAt: Date.now() });
-    }
-    return result;
   }
 
-  // No cache → straight to the resilient call.
-  return callWithRetryAndFallback(ctx, config, params, signal, visionModel, auth.apiKey, auth.headers, loaded.image, modelId, baseDetails);
+  // ── LOCAL-ONLY GATE (SPEC-5 §3.2) ────────────────────────────────────
+  // Cache miss (or no cache) + local-only → refuse the network call. The
+  // cache is local, so cache hits still work (cache-only mode above). Cache
+  // miss → clear error, NO network call (structural guarantee).
+  if (config.localOnly) {
+    const cacheHint = config.cacheEnabled
+      ? "Enable delegation (local-only off) to describe it, or re-use a previously-cached description."
+      : "Enable delegation (local-only off) to describe it.";
+    audit(config, {
+      ts: new Date().toISOString(),
+      provider: config.provider ?? "(unset)",
+      model: modelId,
+      image_path: truncateImagePathForLog(params.image_path),
+      source_hash: loaded.sourceHash,
+      cached: false, fallback: false, fallback_model: undefined,
+      ok: false, error_code: "local_only", latency_ms: 0, local_only: true,
+    });
+    return { ok: false, error: { code: "local_only", message: LOCAL_ONLY_MSG(cacheHint) } };
+  }
+
+  // ── Network call (single path) ───────────────────────────────────────
+  const t0 = performance.now();
+  const result = await callWithRetryAndFallback(ctx, config, params, signal, visionModel, auth.apiKey, auth.headers, loaded.image, modelId, baseDetails);
+  const latency_ms = Math.round(performance.now() - t0);
+
+  // Cache store on success (unchanged semantics from v0.4.0).
+  if (result.ok && useCache && key && cache) {
+    cache.set(key, { text: result.text, details: { ...result.details, cached: false }, storedAt: Date.now() });
+  }
+
+  // ── Audit the network result (success / fallback / failure / abort) ──
+  // PLAN-5 §1.6: `provider` = configured primary (the attempted route);
+  // `model` = result.details.model (the responder); `fallback` +
+  // `fallback_model` disambiguate. local_only is false here (the gate above
+  // returned for local-only; the network path is only reached when off).
+  audit(config, {
+    ts: new Date().toISOString(),
+    provider: config.provider ?? "(unset)",
+    model: result.ok ? result.details.model : modelId,
+    image_path: truncateImagePathForLog(params.image_path),
+    source_hash: loaded.sourceHash,
+    cached: false,
+    fallback: result.ok ? result.details.fallback : false,
+    fallback_model: result.ok && result.details.fallback ? result.details.model : undefined,
+    ok: result.ok,
+    error_code: result.ok ? undefined : result.error.code,
+    latency_ms,
+    local_only: false,
+  });
+  return result;
 }
 
 /**
