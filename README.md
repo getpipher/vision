@@ -84,6 +84,8 @@ model should have `"input": ["text", "image"]`. Other `/vision` subcommands:
 | `/vision paste-mode [hint\|auto\|off]` | Set how pasted images are handled on a text-only primary (no arg → cycle). |
 | `/vision marker-style [code\|bold\|plain]` | Set the markdown style for `[Image-#N]` markers (no arg → show current). |
 | `/vision auto-prompt [<text>\|clear]` | Set/clear the generic auto-delegation prompt (no arg → multi-line editor). |
+| `/vision preview <path>` | Open a full-screen TUI preview of an image (Kitty/iTerm2 graphics, text fallback on tmux). |
+| `/vision batch-concurrency [<1-20>]` | Max parallel image delegations in a batch (`describe_image image_paths` + paste auto mode). 1 = serial; 20 = aggressive. Default 5. |
 
 Config is stored at `~/.pi/agent/vision.json` (not `vision-tool.json`, so it
 doesn't collide with the community package during transition).
@@ -159,6 +161,66 @@ The text fallback still shows useful metadata (filename, dimensions, format,
 file size) and confirms the image was found. Real graphics require running pi
 outside tmux on a graphics-capable terminal.
 
+## Batch + scale (v0.4.0)
+
+`describe_image` accepts **multiple images** in a single call via
+`image_paths` (alongside the single `image_path` for back-compat). For
+text-only primaries (where the tool is visible), this lets the model analyze,
+compare, or cross-reference several images in one tool call instead of N
+serial round-trips:
+
+```
+describe_image(
+  image_paths: ["/tmp/before.png", "/tmp/after.png", "/tmp/diff.png"],
+  prompt: "Compare these three screenshots. What changed?"
+)
+```
+
+Delegations run **in parallel**, bounded by `batchConcurrency` (default 5,
+configurable 1–20 via `/vision batch-concurrency`). `1` = serial escape
+hatch; `20` = aggressive (rate-limit risk is yours). Each image reuses the
+v0.2.x resilience pipeline (cache/retry/fallback) independently — a cache hit
+returns 0 vision-model calls, a failed image becomes an `[error: …]` section
+rather than failing the whole batch, and `isError` is set only if **every**
+image failed. The result is one structured, order-stable text block:
+
+```
+[Batch: 3 image(s)]
+
+[Image 1] /tmp/before.png
+<vision model description>
+
+[Image 2] (cached) /tmp/after.png
+<vision model description>
+
+[Image 3] /tmp/diff.png
+[error: not_found — image not found at /tmp/diff.png]
+```
+
+A hard cap of **50 images** per call (`MAX_BATCH_IMAGES`) defends against an
+over-eager model passing an absurd array; split across calls if you need more.
+
+**Parallel auto-delegation (paste auto mode).** When `textOnlyPasteMode` is
+`"auto"` and you paste multiple image paths, delegations now run in parallel
+(one batch-level timeout = the total budget, bounded by `batchConcurrency`)
+instead of serially — so a 5-screenshot paste completes in ~`ceil(N/c)` ×
+per-call instead of `N` × per-call.
+
+**Hint mode now exposes paths.** In text-only + `"hint"` mode (the default),
+the hint line now **lists the image paths** and names the `image_paths` batch
+affordance, so the model can actually invoke `describe_image` (previously the
+hint named the tool but the path markers erased the paths, leaving the model
+unable to call it). Paste 2+ images and the model learns it can pass them all
+to `image_paths` for batch analysis.
+
+**Clipboard paste just works.** Pi binds `ctrl+v` (`alt+v` on Windows) to
+paste the system clipboard image: it reads the clipboard, writes the bytes to
+`/tmp/pi-clipboard-<uuid>.<ext>`, and inserts that path at the cursor. Our
+existing path-token pipeline detects it, renders a `[Image-#N]` marker, and
+attaches (multimodal) or delegates (text-only) — no separate clipboard code
+path needed. Multi-image clipboard = N `ctrl+v` presses = N paths = handled
+as a batch.
+
 ## How it works
 
 Two mechanisms combine to guarantee the behavior:
@@ -181,24 +243,35 @@ Two mechanisms combine to guarantee the behavior:
 
 ## Using `describe_image`
 
-The tool accepts a file path, data URL, or raw base64:
+The tool accepts a file path, data URL, or raw base64. For a **single image**:
 
 ```
 describe_image(image_path: "/tmp/screenshot.png", prompt: "What's in this image?")
+```
+
+For **multiple images** (batch — parallel delegation, one structured result):
+
+```
+describe_image(
+  image_paths: ["/tmp/a.png", "/tmp/b.png", "/tmp/c.png"],
+  prompt: "Compare these screenshots. What changed between them?"
+)
 ```
 
 Parameters:
 
 | Param | Type | Description |
 |---|---|---|
-| `image_path` | string | File path, `data:` URL, or raw base64 |
-| `prompt` | string | What to analyze or answer about the image |
-| `compress` | boolean? | Optimize the image before delegation (default `true`) |
+| `image_path` | string? | Path to a single image, `data:` URL, or raw base64. Use for one image. |
+| `image_paths` | string[]? | Multiple paths to analyze together (comparison/cross-reference). Up to 50. |
+| `prompt` | string | What to analyze or answer about the image(s). For a batch, applies to each; describe what to compare. |
+| `compress` | boolean? | Optimize the image(s) before delegation (default `true`) |
 | `reasoning` | enum? | Reasoning effort for the delegation (`off`…`xhigh`) |
 
 When caching or fallback is active, the tool result `details` include
 `cached: true` (cache hit) and `fallback: true` (result from the fallback
-model) for traceability.
+model) for traceability. For a batch, `details.batch` is an array of per-image
+results (index, path, ok, cached, fallback, errorCode) in input order.
 
 For multimodal primaries you don't call `describe_image` — just reference the
 image path in your message and the model sees it natively.
