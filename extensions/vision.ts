@@ -41,6 +41,7 @@ import {
   DEFAULT_CONFIG,
   loadConfig,
   MARKER_STYLES,
+  MAX_BATCH_IMAGES,
   PASTE_MODES,
   REASONING_LEVELS,
   saveConfig,
@@ -53,6 +54,8 @@ import { setSharedState } from "../lib/state.ts";
 import { createPreviewComponent, makePreviewImage, detectProtocol, formatImageMetadata } from "../lib/preview.ts";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { loadImage } from "../lib/image.ts";
+import { mapWithConcurrency } from "../lib/batch.ts";
+import { buildBatchToolResult } from "../lib/marker.ts";
 
 /** Current config. Loaded on session_start, mutated by /vision, saved to disk. */
 let config: VisionConfig = { ...DEFAULT_CONFIG };
@@ -84,6 +87,7 @@ const SUBCOMMANDS = [
   "marker-style",
   "auto-prompt",
   "preview",
+  "batch-concurrency",
 ] as const;
 
 function formatConfigStatus(c: VisionConfig): string {
@@ -105,6 +109,7 @@ function formatConfigStatus(c: VisionConfig): string {
     `  autoTimeout:     ${c.autoDelegateTimeoutMs}ms`,
     `  composePreview:  ${c.composePreview}`,
     `  previewMaxWidth: ${c.previewMaxWidthCells} cells`,
+    `  batchConcurrency: ${c.batchConcurrency}`,
   ].join("\n");
 }
 
@@ -153,6 +158,8 @@ function renderValue(id: string): string {
       return config.composePreview ? "on" : "off";
     case "previewMaxWidthCells":
       return `${config.previewMaxWidthCells}`;
+    case "batchConcurrency":
+      return `${config.batchConcurrency}`;
     default:
       return "";
   }
@@ -343,6 +350,14 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
         values: ["40", "60", "80", "100", "120"],
         description: "Max width (in terminal cells) for the image preview rendering.",
       },
+      // ── v0.4.0 (SPEC-4) rows ──────────────────────────────────────────
+      {
+        id: "batchConcurrency",
+        label: "Batch concurrency",
+        currentValue: renderValue("batchConcurrency"),
+        values: ["1", "3", "5", "10", "20"],
+        description: "Max parallel image delegations in a batch (describe_image image_paths + paste auto mode). 1 = serial; 20 = aggressive (rate-limit risk).",
+      },
     ];
 
     const settingsList = new SettingsList(
@@ -430,6 +445,46 @@ function buildAutoPromptInput(
   return input;
 }
 
+/** Normalize the model's image_path / image_paths args into a deduped
+ *  `string[]`. Schema-tolerant: some models (Opus 4.6, GLM-5.1) send arrays
+ *  as a JSON string (edit.js:36 precedent) — coerce that. Accepts
+ *  `string | string[] | undefined` for both fields. Merges image_paths first
+ *  (the batch field) then image_path, filters empties, dedups case-sensitively
+ *  preserving first-occurrence order. (SPEC-4 §3.1, PLAN-4 §1.1/§1.6.) */
+function normalizeImagePaths(params: {
+  image_path?: string | string[];
+  image_paths?: string | string[];
+}): string[] {
+  const coerce = (v: string | string[] | undefined): string[] => {
+    if (v === undefined) return [];
+    if (Array.isArray(v)) return v.filter((x) => typeof x === "string");
+    if (typeof v !== "string") return [];
+    const s = v.trim();
+    if (s === "") return [];
+    // Maybe a JSON-stringified array (some models send arrays as JSON strings)
+    if (s.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(s);
+        if (Array.isArray(parsed)) return parsed.filter((x) => typeof x === "string");
+      } catch {
+        // not valid JSON → treat as a single path string
+      }
+    }
+    return [s];
+  };
+  const merged = [...coerce(params.image_paths), ...coerce(params.image_path)];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of merged) {
+    const t = typeof p === "string" ? p.trim() : "";
+    if (t.length === 0) continue;
+    if (seen.has(t)) continue; // dedup, first occurrence wins
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
 export default function visionExtension(pi: ExtensionAPI): void {
   // ── Session lifecycle ───────────────────────────────────────────────────
   pi.on("session_start", (_event, ctx) => {
@@ -455,28 +510,35 @@ export default function visionExtension(pi: ExtensionAPI): void {
     name: TOOL_NAME,
     label: "Describe Image",
     description:
-      "Analyze an image file and return a text description or answer questions about it. Delegates to a configured vision model when the active primary model cannot process images natively. Accepts a file path, data URL, or raw base64.",
+      "Analyze one or more image files and return text descriptions or answer questions about them. Delegates to a configured vision model when the active primary model cannot process images natively. Accepts file paths, data URLs, or raw base64. For multiple images (comparison, cross-reference), pass image_paths (up to 50).",
     promptSnippet:
-      "Analyze an image file and return a text description or answer questions about it",
+      "Analyze one or more image files and return text descriptions or answer questions about them",
     promptGuidelines: [
-      "Use describe_image when you need to analyze an image file and the active model cannot process images natively. describe_image delegates to a configured vision model and returns its text response.",
+      "Use describe_image when you need to analyze an image file and the active model cannot process images natively. describe_image delegates to a configured vision model and returns its text response. For 2+ images, pass image_paths for batch analysis (parallel, one call).",
     ],
     parameters: Type.Object({
-      image_path: Type.String({
-        description: "Path to the image file, a data: URL, or raw base64 data.",
-      }),
+      image_path: Type.Optional(
+        Type.String({
+          description: "Path to a single image file, a data: URL, or raw base64. Use this for one image. For multiple images, prefer image_paths.",
+        }),
+      ),
+      image_paths: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Multiple image paths/data URLs/base64 strings to analyze together (e.g. for comparison or cross-reference). Use this for 2+ images. Up to 50 images per call.",
+        }),
+      ),
       prompt: Type.String({
-        description: "What to analyze, extract, or answer about the image.",
+        description: "What to analyze, extract, or answer about the image(s). For multiple images, this prompt applies to each; describe what to compare or how they relate.",
       }),
       compress: Type.Optional(
         Type.Boolean({
-          description: "Optimize (resize + re-encode) the image before delegation. Default true.",
+          description: "Optimize (resize + re-encode) the image(s) before delegation. Default true.",
         }),
       ),
       reasoning: Type.Optional(
         StringEnum([...REASONING_LEVELS], {
           description:
-            "Reasoning effort for the delegation call. Defaults to the configured defaultReasoningEffort.",
+            "Reasoning effort for the delegation call(s). Defaults to the configured defaultReasoningEffort.",
         }),
       ),
     }),
@@ -498,24 +560,74 @@ export default function visionExtension(pi: ExtensionAPI): void {
         };
       }
 
-      const delegateParams: DelegateParams = {
-        image_path: params.image_path,
-        prompt: params.prompt,
-        compress: params.compress ?? true,
-        reasoning: (params.reasoning ?? config.defaultReasoningEffort) as ReasoningLevel,
-      };
-
-      const result = await delegateToVisionModel(ctx, config, delegateParams, signal, cache);
-      if (result.ok) {
+      // v0.4.0: normalize + validate paths (image_path | image_paths).
+      const paths = normalizeImagePaths(params);
+      if (paths.length === 0) {
         return {
-          content: [{ type: "text" as const, text: result.text }],
-          details: { mode: "delegate", ...result.details },
+          content: [{ type: "text" as const, text: "Vision tool error: describe_image requires image_path or image_paths (got neither)." }],
+          details: { mode: "delegate", error: "no_image_path" },
+          isError: true,
         };
       }
+      if (paths.length > MAX_BATCH_IMAGES) {
+        return {
+          content: [{ type: "text" as const, text: `Vision tool error: describe_image received ${paths.length} images; the batch cap is ${MAX_BATCH_IMAGES}. Split across multiple calls.` }],
+          details: { mode: "delegate", error: "batch_too_large" },
+          isError: true,
+        };
+      }
+
+      const reasoning = (params.reasoning ?? config.defaultReasoningEffort) as ReasoningLevel;
+      const compress = params.compress ?? true;
+
+      // Single-image back-compat path (v0.3.x behavior, byte-for-byte).
+      if (paths.length === 1) {
+        const result = await delegateToVisionModel(ctx, config, { image_path: paths[0]!, prompt: params.prompt, compress, reasoning }, signal, cache);
+        if (result.ok) {
+          return { content: [{ type: "text" as const, text: result.text }], details: { mode: "delegate", ...result.details } };
+        }
+        return {
+          content: [{ type: "text" as const, text: result.error.message }],
+          details: { mode: "delegate", error: result.error.code },
+          isError: true,
+        };
+      }
+
+      // Batch path: parallel, bounded by batchConcurrency, per-image resilience
+      // (fn wraps to sentinel — a failed image becomes an [error: …] section,
+      // never a whole-batch reject). Uses ctx.signal (defined during the agent
+      // run — verified PLAN-3 §1.3). No extra batch timeout.
+      const batchResults = await mapWithConcurrency(paths, config.batchConcurrency, async (p) => {
+        try {
+          const r = await delegateToVisionModel(ctx, config, { image_path: p, prompt: params.prompt, compress, reasoning }, signal, cache);
+          if (r.ok) {
+            return { ok: true as const, text: r.text, cached: r.details.cached, fallback: r.details.fallback, fallbackModel: r.details.fallback ? r.details.model : undefined };
+          }
+          return { ok: false as const, errorCode: r.error.code, message: r.error.message };
+        } catch (err) {
+          // belt-and-suspenders: delegateToVisionModel doesn't throw, but guard
+          return { ok: false as const, errorCode: "unexpected", message: err instanceof Error ? err.message : String(err) };
+        }
+      });
+
+      const text = buildBatchToolResult(paths, batchResults);
+      const allFailed = batchResults.every((r) => !r.ok);
       return {
-        content: [{ type: "text" as const, text: result.error.message }],
-        details: { mode: "delegate", error: result.error.code },
-        isError: true,
+        content: [{ type: "text" as const, text }],
+        details: {
+          mode: "delegate-batch",
+          batch: batchResults.map((r, i) => ({
+            index: i,
+            path: paths[i]!,
+            ok: r.ok,
+            cached: r.ok ? r.cached : false,
+            fallback: r.ok ? r.fallback : false,
+            errorCode: r.ok ? undefined : r.errorCode,
+          })),
+        },
+        // Only flag isError when EVERY image failed (matches single-path back-compat,
+        // which omits isError on success). A partial failure is NOT a whole-batch error.
+        ...(allFailed ? { isError: true as const } : {}),
       };
     },
   });
@@ -785,6 +897,23 @@ export default function visionExtension(pi: ExtensionAPI): void {
               },
             } as Component & { dispose?(): void };
           });
+          return;
+        }
+        case "batch-concurrency": {
+          const raw = parts[1];
+          if (!raw) {
+            ctx.ui.notify(`Batch concurrency: ${config.batchConcurrency} (1–20). 1 = serial, 20 = aggressive.`, "info");
+            return;
+          }
+          const n = parseInt(raw, 10);
+          if (!Number.isFinite(n)) {
+            ctx.ui.notify("Usage: /vision batch-concurrency <1-20>", "warning");
+            return;
+          }
+          config = applySettingChange(config, "batchConcurrency", String(n));
+          saveConfig(config, agentDir);
+          setSharedState(config, cache);
+          ctx.ui.notify(`Batch concurrency set to ${config.batchConcurrency}.`, "info");
           return;
         }
         default: {

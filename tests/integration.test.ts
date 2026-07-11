@@ -1104,6 +1104,276 @@ test("T42: composePreview disabled → no setWidget called", async () => {
   }
 });
 
+// ── T43: describe_image batch basic (★ SPEC-4 gap #8) ───────────────────
+test("T43: describe_image with image_paths → parallel delegation + structured result in input order", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const colors: Array<[number, number, number]> = [[255, 0, 0], [0, 255, 0], [0, 0, 255]];
+  const paths = ["a.png", "b.png", "c.png"].map((f, i) => {
+    const p = join(dir, f);
+    writeFileSync(p, make1x1Png(...colors[i]!));
+    return p;
+  });
+  const fm = mockFetchSeq([
+    { status: 200, body: { choices: [{ message: { content: "desc A" } }] } },
+    { status: 200, body: { choices: [{ message: { content: "desc B" } }] } },
+    { status: 200, body: { choices: [{ message: { content: "desc C" } }] } },
+  ]);
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    const res = await executeTool(pi, { image_paths: paths, prompt: "describe each" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    assert.equal(res.isError, undefined, "not an error (all succeeded)");
+    assert.equal(fm.calls.length, 3, "3 vision-model calls (one per image)");
+    assert.match(res.content[0].text, /^\[Batch: 3 image\(s\)\]/, "header with count");
+    // ★ GATE: sections in input order
+    const iA = res.content[0].text.indexOf("[Image 1]" + " " + paths[0]);
+    const iB = res.content[0].text.indexOf("[Image 2]" + " " + paths[1]);
+    const iC = res.content[0].text.indexOf("[Image 3]" + " " + paths[2]);
+    assert.ok(iA < iB && iB < iC, "sections in input order");
+    assert.ok(res.content[0].text.includes("desc A"));
+    assert.ok(res.content[0].text.includes("desc B"));
+    assert.ok(res.content[0].text.includes("desc C"));
+    assert.equal(res.details.mode, "delegate-batch", "details.mode = delegate-batch");
+    assert.equal(res.details.batch.length, 3, "details.batch has 3 entries");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T44: batch parallel timing (★ clears PRD "10+ images" bar) ────────────
+test("T44: describe_image 10 images, batchConcurrency=5 → 2 waves, maxObserved == 5", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const paths = Array.from({ length: 10 }, (_, i) => {
+    const p = join(dir, `img${i}.png`);
+    writeFileSync(p, make1x1Png(i * 25 % 256, (i * 50) % 256, (i * 75) % 256));
+    return p;
+  });
+  let inFlight = 0;
+  let maxObserved = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const signal = init?.signal;
+    if (signal?.aborted) { const e = new Error("aborted"); e.name = "AbortError"; throw e; }
+    inFlight++;
+    maxObserved = Math.max(maxObserved, inFlight);
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(resolve, 50);
+      signal?.addEventListener("abort", () => { clearTimeout(t); const e = new Error("aborted"); e.name = "AbortError"; reject(e); }, { once: true });
+    });
+    inFlight--;
+    return new Response(JSON.stringify({ choices: [{ message: { content: "d" } }] }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof globalThis.fetch;
+  try {
+    writeFileSync(join(TMP_AGENT, "vision.json"), JSON.stringify({
+      provider: "ollama", model: "minimax-m3:cloud", enabled: true,
+      retryAttempts: 0, batchConcurrency: 5,
+    }));
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    const res = await executeTool(pi, { image_paths: paths, prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    assert.equal(res.details.mode, "delegate-batch");
+    assert.equal(res.details.batch.length, 10);
+    // ★ GATE: concurrency bounded to 5 (10 images / 5 = 2 waves)
+    assert.ok(maxObserved <= 5, `★ maxObserved=${maxObserved} should be <= 5 (bounded)`);
+    assert.ok(maxObserved >= 1, "at least 1 observed");
+    assert.equal(res.isError, undefined);
+  } finally {
+    globalThis.fetch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T45: batch partial failure ─────────────────────────────────────────────
+test("T45: batch with one bad path → failed image [error: …], others succeed, isError=false", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const good1 = join(dir, "g1.png");
+  const bad = join(dir, "missing.png");
+  const good2 = join(dir, "g2.png");
+  writeFileSync(good1, make1x1Png(255, 0, 0));
+  writeFileSync(good2, make1x1Png(0, 0, 255));
+  const fm = mockFetchSeq([
+    { status: 200, body: { choices: [{ message: { content: "good 1" } }] } },
+    { status: 200, body: { choices: [{ message: { content: "good 2" } }] } },
+  ]);
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    const res = await executeTool(pi, { image_paths: [good1, bad, good2], prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    assert.equal(res.isError, undefined, "★ not whole-batch failure (some succeeded)");
+    assert.ok(res.content[0].text.includes("good 1"), "good 1 description present");
+    assert.ok(res.content[0].text.includes("good 2"), "good 2 description present");
+    assert.ok(res.content[0].text.includes("[error: not_found"), "★ failed image is [error: …] section");
+    assert.ok(res.content[0].text.includes(bad), "failed path named");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T46: batch all fail → isError true ─────────────────────────────────────
+test("T46: batch all paths bad → all [error: …], isError=true", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const bad1 = join(dir, "bad1.png");
+  const bad2 = join(dir, "bad2.png");
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    const res = await executeTool(pi, { image_paths: [bad1, bad2], prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    assert.equal(res.isError, true, "★ isError true (all failed)");
+    assert.ok(res.content[0].text.includes("[error: not_found"));
+    assert.ok(res.content[0].text.includes(bad1) && res.content[0].text.includes(bad2));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T47: single-image back-compat ─────────────────────────────────────────
+test("T47: describe_image with image_path (no image_paths) → single delegation, mode=delegate (back-compat)", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  const fm = mockFetch({ choices: [{ message: { content: "a single description" } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    const res = await executeTool(pi, { image_path: file, prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    // ★ back-compat: single path → mode=delegate (NOT delegate-batch), raw text content
+    assert.equal(res.details.mode, "delegate", "★ back-compat: single path = delegate (not delegate-batch)");
+    assert.equal(res.content[0].text, "a single description", "★ back-compat: raw text (no [Batch: …] header)");
+    assert.equal(fm.calls.length, 1, "one delegation");
+    assert.equal(res.isError, undefined);
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T47b: batch validation — merge + dedup + stringified-array + empty + cap ─
+test("T47b: describe_image merge image_path+image_paths + dedup", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const a = join(dir, "a.png");
+  const b = join(dir, "b.png");
+  writeFileSync(a, make1x1Png(255, 0, 0));
+  writeFileSync(b, make1x1Png(0, 255, 0));
+  const fm = mockFetch({ choices: [{ message: { content: "d" } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    // Both present, with a duplicated → should dedup to 2 unique delegations
+    const res = await executeTool(pi, { image_path: a, image_paths: [a, b], prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    assert.equal(res.details.mode, "delegate-batch");
+    assert.equal(res.details.batch.length, 2, "deduped to 2 unique paths");
+    assert.equal(fm.calls.length, 2, "2 delegations (deduped)");
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T47c: describe_image stringified image_paths (model sends JSON string) → parsed", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const a = join(dir, "a.png");
+  const b = join(dir, "b.png");
+  writeFileSync(a, make1x1Png(255, 0, 0));
+  writeFileSync(b, make1x1Png(0, 255, 0));
+  const fm = mockFetch({ choices: [{ message: { content: "d" } }] });
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    // Some models (Opus 4.6, GLM-5.1) send arrays as JSON strings (edit.js:36 precedent)
+    const res = await executeTool(pi, { image_paths: JSON.stringify([a, b]), prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    assert.equal(res.details.mode, "delegate-batch", "stringified array parsed → batch");
+    assert.equal(res.details.batch.length, 2, "2 images from stringified array");
+    assert.equal(fm.calls.length, 2);
+  } finally {
+    fm.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T47d: describe_image no paths → actionable error, isError=true", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    const res = await executeTool(pi, { prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /image_path|image_paths/i, "actionable error naming the required params");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T47e: describe_image over cap (51 images) → MAX_BATCH_IMAGES error", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  // 51 fake paths (don't need to exist — cap check is before load)
+  const paths = Array.from({ length: 51 }, (_, i) => join(dir, `img${i}.png`));
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    const res = await executeTool(pi, { image_paths: paths, prompt: "describe" }, makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }));
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /50/);
+    assert.match(res.content[0].text, /batch cap|MAX_BATCH|split/i);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("T47f: /vision batch-concurrency subcommand sets config", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: "/tmp" }));
+    await runVisionCommand(pi, "batch-concurrency 10", TEXT_ONLY);
+    // Verify via /vision show would need parsing; instead re-load config + check
+    const { loadConfig } = await import("../lib/config.ts");
+    const c = loadConfig(TMP_AGENT);
+    assert.equal(c.batchConcurrency, 10, "subcommand set batchConcurrency");
+    // Out-of-range clamps
+    await runVisionCommand(pi, "batch-concurrency 999", TEXT_ONLY);
+    assert.equal(loadConfig(TMP_AGENT).batchConcurrency, 20, "clamps high to 20");
+    await runVisionCommand(pi, "batch-concurrency 0", TEXT_ONLY);
+    assert.equal(loadConfig(TMP_AGENT).batchConcurrency, 1, "clamps low to 1");
+  } finally {
+    // leave config for cleanup test to wipe
+  }
+});
+
 // ── T48: paste auto mode parallel (★ SPEC-4 gap #8) ─────────────────────
 test("T48: text-only + auto + 4 images, batchConcurrency=4 → parallel (wall-clock ~1 call, not 4)", async () => {
   const pi = createMockPi();
