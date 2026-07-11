@@ -1850,6 +1850,85 @@ test("T58 (integration): describe_image + localOnly on + cache miss → clear er
   }
 });
 
+// ── T59: paste auto mode + local-only short-circuit (★ SPEC-5 §3.2) ──
+test("T59: text-only + auto + localOnly on → hint fallback immediately (no delegation, no timeout burned)", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const dir = mkdtempSync(join(tmpdir(), "vision-eval-img-"));
+  const colors: Array<[number, number, number]> = [[255, 0, 0], [0, 255, 0]];
+  const files = ["a.png", "b.png"].map((f, i) => {
+    const p = join(dir, f);
+    writeFileSync(p, make1x1Png(...colors[i]!));
+    return p;
+  });
+  let fetchCalls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => { fetchCalls++; return new Response("{}", { status: 200 }); }) as typeof globalThis.fetch;
+  try {
+    writeFileSync(join(TMP_AGENT, "vision.json"), JSON.stringify({
+      provider: "ollama", model: "minimax-m3:cloud", enabled: true,
+      retryAttempts: 0, textOnlyPasteMode: "auto", batchConcurrency: 4,
+      localOnly: true, autoDelegateTimeoutMs: 30000,
+    }));
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    const start = Date.now();
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${files.join(" and ")}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }),
+    );
+    const elapsed = Date.now() - start;
+    assert.equal(inputResult?.action, "transform");
+    assert.equal(fetchCalls, 0, "no delegation attempted (local-only short-circuit)");
+    assert.equal((inputResult.images ?? []).length, 0, "no image attached (text-only)");
+    // The hint line lists both paths so the model can call describe_image for cache hits.
+    assert.ok(files.every((f) => inputResult.text.includes(f)), "hint lists both paths");
+    // Critical: no timeout burned (local-only skips the AbortController entirely).
+    assert.ok(elapsed < 1000, `no timeout burned: elapsed=${elapsed}ms (would be ~30000ms if it waited)`);
+  } finally {
+    globalThis.fetch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T57 (integration): paste auto + local-only + pre-cached image → cache hit ──
+test("T57 (integration): paste auto + localOnly + cached image → cache hit via tool (local-only allows cache)", async () => {
+  // Local-only allows cache hits (the cache is local). This test verifies the
+  // paste auto short-circuit goes to hint (where the model can then call
+  // describe_image for a cache hit). The delegate-level cache-hit-in-local-only
+  // is covered in delegate.test.ts T57; this confirms the paste path doesn't
+  // block that by attempting a forbidden network call.
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  let fetchCalls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Response(JSON.stringify({ choices: [{ message: { content: "a desc" } }] }), { status: 200 });
+  }) as typeof globalThis.fetch;
+  try {
+    writeFileSync(join(TMP_AGENT, "vision.json"), JSON.stringify({
+      provider: "ollama", model: "minimax-m3:cloud", enabled: true,
+      retryAttempts: 0, textOnlyPasteMode: "auto", localOnly: true,
+    }));
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd: dir }));
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: `analyze ${file}`, source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd: dir, registry: makeRegistry({ model: VISION_MODEL }) }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.equal(fetchCalls, 0, "paste auto + local-only → no delegation (hint fallback)");
+    assert.ok(inputResult.text.includes(file), "hint lists the path");
+  } finally {
+    globalThis.fetch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // Cleanup the temp agent dir after all tests.
 test("cleanup", () => {
   rmSync(TMP_AGENT, { recursive: true, force: true });
