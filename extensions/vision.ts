@@ -738,6 +738,15 @@ export default function visionExtension(pi: ExtensionAPI): void {
             ctx.ui.notify("Usage: /vision preview <image-path>", "warning");
             return;
           }
+          // Clear compose preview widget if active (prevent interference)
+          if (typeof ctx.ui.setWidget === "function") {
+            ctx.ui.setWidget("vision-compose-preview", undefined);
+          }
+          // Helpful error if the user passed a marker instead of a path
+          if (path.includes("[Image-#") || path.startsWith("`")) {
+            ctx.ui.notify("Vision preview: pass a file path, not a marker. Example: /vision preview /tmp/screenshot.png", "warning");
+            return;
+          }
           if (ctx.mode !== "tui") {
             // Non-TUI: notify metadata as text
             const loaded = await loadImage(path, { compress: false, maxDimension: 1568, jpegQuality: 85, cwd: ctx.cwd });
