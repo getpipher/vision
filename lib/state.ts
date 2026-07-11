@@ -6,39 +6,56 @@
  * reuses the exact same cache as explicit `describe_image` calls (cross-path
  * cache hits: auto-describe now → describe_image later = cache hit).
  *
+ * **IMPORTANT:** pi creates a separate jiti module instance for each extension
+ * (each `loadExtensionModule` call constructs a fresh `createJiti`). So
+ * module-level `let _config` variables are NOT shared between vision.ts and
+ * paste.ts — each gets its own copy. We use `globalThis` instead, which is
+ * shared across the entire Node.js process regardless of module caching.
+ *
  * `vision.ts` calls `setSharedState` on `session_start` + every mutation
  * (`applyAndSave`, `rebuildCache`). `paste.ts` reads via `getSharedConfig` /
  * `getSharedCache`. Falls back gracefully (returns undefined) if read before
  * `session_start` fires — the paste hook returns `continue` in that case.
- *
- * Leaf module: imports only types, no extension imports → no circular
- * dependency risk.
  */
 import type { VisionConfig } from "./config.ts";
 import type { VisionCache } from "./cache.ts";
 
-let _config: VisionConfig | undefined;
-let _cache: VisionCache | undefined;
+const GLOBAL_KEY = "__getpipher_vision_shared_state__";
+
+interface SharedState {
+  config: VisionConfig | undefined;
+  cache: VisionCache | undefined;
+}
+
+/** Get (or initialize) the shared state on globalThis. */
+function getState(): SharedState {
+  const g = globalThis as Record<string, unknown>;
+  if (!g[GLOBAL_KEY]) {
+    g[GLOBAL_KEY] = { config: undefined, cache: undefined } as SharedState;
+  }
+  return g[GLOBAL_KEY] as SharedState;
+}
 
 /** Set the shared config + cache refs. Called by vision.ts on session_start
  *  + after every config/cache mutation. */
 export function setSharedState(config: VisionConfig, cache: VisionCache): void {
-  _config = config;
-  _cache = cache;
+  const state = getState();
+  state.config = config;
+  state.cache = cache;
 }
 
 /** Get the shared config, or undefined if session_start hasn't fired yet. */
 export function getSharedConfig(): VisionConfig | undefined {
-  return _config;
+  return getState().config;
 }
 
 /** Get the shared cache, or undefined if session_start hasn't fired yet. */
 export function getSharedCache(): VisionCache | undefined {
-  return _cache;
+  return getState().cache;
 }
 
 /** Clear the shared state (testing utility). */
 export function clearSharedState(): void {
-  _config = undefined;
-  _cache = undefined;
+  const g = globalThis as Record<string, unknown>;
+  delete g[GLOBAL_KEY];
 }
