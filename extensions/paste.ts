@@ -37,6 +37,7 @@ import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import type { ReasoningLevel } from "../lib/config.ts";
 import { createComposePreviewComponent, makePreviewImage } from "../lib/preview.ts";
 import { clearSharedState } from "../lib/state.ts";
+import { mapWithConcurrency } from "../lib/batch.ts";
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 // Matches path-like tokens (absolute /…, home ~/…, relative ./…/…/) ending in a
@@ -175,15 +176,17 @@ function buildResolvedMap(
 }
 
 /** Auto-delegate a single image with timeout protection. Returns the
- *  description text or undefined on failure/timeout (caller falls back to hint). */
+ *  description text or undefined on failure/timeout (caller falls back to hint).
+ *  v0.4.0: takes the shared batch `signal` (owned by the caller) instead of
+ *  creating its own AbortController — the batch owns one timeout for all
+ *  images, bounding the wall-clock of the pre-send input hook. */
 async function autoDelegateOne(
   ctx: ExtensionContext,
   config: NonNullable<ReturnType<typeof getSharedConfig>>,
   image: LoadedImage,
   cache: NonNullable<ReturnType<typeof getSharedCache>>,
+  signal: AbortSignal,
 ): Promise<{ text: string; cached: boolean } | undefined> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.autoDelegateTimeoutMs);
   try {
     const params: DelegateParams = {
       image_path: image.abs,
@@ -191,15 +194,13 @@ async function autoDelegateOne(
       compress: true,
       reasoning: "off" as ReasoningLevel,
     };
-    const result = await delegateToVisionModel(ctx, config, params, controller.signal, cache);
+    const result = await delegateToVisionModel(ctx, config, params, signal, cache);
     if (result.ok) {
       return { text: result.text, cached: result.details.cached };
     }
     return undefined; // failure → caller falls back to hint
   } catch {
     return undefined; // timeout or error → hint fallback
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -367,33 +368,48 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
       return { action: "transform" as const, text };
     }
 
-    // mode === "auto": auto-delegate each image + append descriptions.
+    // mode === "auto": auto-delegate each image in PARALLEL (v0.4.0 SPEC-4 §3.2)
+    // with bounded concurrency + ONE batch-level AbortController (the budget
+    // bounds the pre-send wall-clock, not per-image). Reuses the v0.2.x delegate
+    // pipeline (cache/retry/fallback) per image. Falls back to hint on timeout/
+    // failure (all-fail → hint; per-image fail → that image gets no description).
     const cache = getSharedCache();
     const visionModel = config.provider && config.model ? `${config.provider}/${config.model}` : "(unconfigured)";
+    const hintImages = loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i }));
 
     if (!cache || !config.provider || !config.model) {
       // Can't delegate (no cache or unconfigured) → fall back to hint.
-      text = `${text}\n${buildHintLine(loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i })))}`;
+      text = `${text}\n${buildHintLine(hintImages)}`;
       return { action: "transform" as const, text };
     }
 
-    const descriptions: Array<{ token: string; index: number; text: string; cached: boolean }> = [];
-    let allFailed = true;
-
-    for (const image of loaded) {
-      const result = await autoDelegateOne(ctx, config, image, cache);
-      if (result) {
-        const idx = resolved.get(image.token)?.index ?? 0;
-        descriptions.push({ token: image.token, index: idx, text: result.text, cached: result.cached });
-        allFailed = false;
-      }
-      // On undefined (failure/timeout) → that image gets no description.
-      // If ALL fail, we fall back to hint below.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), config.autoDelegateTimeoutMs);
+    let results: Array<{ text: string; cached: boolean } | undefined>;
+    try {
+      results = await mapWithConcurrency(
+        loaded,
+        config.batchConcurrency,
+        (image) => autoDelegateOne(ctx, config, image, cache, controller.signal),
+      );
+    } finally {
+      clearTimeout(timer);
     }
 
-    if (allFailed) {
-      // All delegations failed → hint fallback for all images.
-      text = `${text}\n${buildHintLine(loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i })))}`;
+    const descriptions: Array<{ token: string; index: number; text: string; cached: boolean }> = [];
+    let ok = 0;
+    for (let i = 0; i < loaded.length; i++) {
+      const r = results[i];
+      if (r) {
+        descriptions.push({ token: loaded[i]!.token, index: resolved.get(loaded[i]!.token)?.index ?? i, text: r.text, cached: r.cached });
+        ok++;
+      }
+      // undefined → that image gets no description (timeout/failure mid-batch)
+    }
+
+    if (ok === 0) {
+      // All failed/timed out → hint fallback (with paths, §3.4).
+      text = `${text}\n${buildHintLine(hintImages)}`;
       return { action: "transform" as const, text };
     }
 

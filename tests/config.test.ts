@@ -361,8 +361,8 @@ test("mergeConfig: empty autoDelegatePrompt → default", () => {
   assert.equal(mergeConfig({ autoDelegatePrompt: "  " }).autoDelegatePrompt, DEFAULT_CONFIG.autoDelegatePrompt);
 });
 
-test("mergeConfig: clamps autoDelegateTimeoutMs to [5000, 120000]", () => {
-  assert.equal(mergeConfig({ autoDelegateTimeoutMs: 1000 }).autoDelegateTimeoutMs, 5000);
+test("mergeConfig: clamps autoDelegateTimeoutMs to [1000, 120000]", () => {
+  assert.equal(mergeConfig({ autoDelegateTimeoutMs: 500 }).autoDelegateTimeoutMs, 1000);
   assert.equal(mergeConfig({ autoDelegateTimeoutMs: 999999 }).autoDelegateTimeoutMs, 120000);
 });
 
@@ -391,7 +391,7 @@ test("applySettingChange: autoDelegatePrompt set / empty → default", () => {
 
 test("applySettingChange: autoDelegateTimeoutMs parse + clamp", () => {
   assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "60000").autoDelegateTimeoutMs, 60000);
-  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "1000").autoDelegateTimeoutMs, 5000);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "500").autoDelegateTimeoutMs, 1000);
   assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "999999").autoDelegateTimeoutMs, 120000);
 });
 

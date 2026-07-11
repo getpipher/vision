@@ -177,7 +177,7 @@ export function mergeConfig(partial: unknown): VisionConfig {
     markerStyle: isMarkerStyle(p.markerStyle) ? p.markerStyle : DEFAULT_CONFIG.markerStyle,
     textOnlyPasteMode: isPasteMode(p.textOnlyPasteMode) ? p.textOnlyPasteMode : DEFAULT_CONFIG.textOnlyPasteMode,
     autoDelegatePrompt: strOrUndef(p.autoDelegatePrompt) ?? DEFAULT_CONFIG.autoDelegatePrompt,
-    autoDelegateTimeoutMs: clampInt(p.autoDelegateTimeoutMs, 5000, 120000, DEFAULT_CONFIG.autoDelegateTimeoutMs),
+    autoDelegateTimeoutMs: clampInt(p.autoDelegateTimeoutMs, 1000, 120000, DEFAULT_CONFIG.autoDelegateTimeoutMs),
     // v0.3.3 fields
     composePreview: typeof p.composePreview === "boolean" ? p.composePreview : DEFAULT_CONFIG.composePreview,
     previewMaxWidthCells: clampInt(p.previewMaxWidthCells, 20, 200, DEFAULT_CONFIG.previewMaxWidthCells),
@@ -295,7 +295,7 @@ export function applySettingChange(
     case "autoDelegateTimeoutMs": {
       const n = parseInt(value, 10);
       if (!Number.isFinite(n)) return config;
-      return { ...config, autoDelegateTimeoutMs: Math.min(120000, Math.max(5000, n)) };
+      return { ...config, autoDelegateTimeoutMs: Math.min(120000, Math.max(1000, n)) };
     }
     case "composePreview":
       return { ...config, composePreview: value === "on" };
