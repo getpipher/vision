@@ -938,6 +938,139 @@ test("T36: marker numbering offset — pre-existing images → #3", async () => 
 // (Covered by the existing T1–T27 tests above; this is a documentation marker.
 // If any prior test fails, the suite fails here too. No separate assertions needed.)
 
+// ── T38: compose-time preview calls setWidget with Image ──
+test("T38: compose-time preview — setWidget called when image path detected", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  let widgetSet = false;
+  try {
+    const ctx = makeCtx({ model: MULTIMODAL, cwd: dir }) as any;
+    ctx.hasUI = true;
+    ctx.ui.setWidget = (key: string, content: any) => { if (content !== undefined) widgetSet = true; };
+    ctx.ui.getEditorText = () => `analyze ${file}`;
+    ctx.ui.onTerminalInput = (handler: any) => { (ctx as any)._inputHandler = handler; return () => {}; };
+
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+    if ((ctx as any)._inputHandler) (ctx as any)._inputHandler("a");
+    await new Promise((r) => setTimeout(r, 400));
+    assert.ok(widgetSet, "setWidget called with a component factory after debounce");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T39: compose-time preview clear on path removal ──
+test("T39: compose-time preview — widget cleared when path removed from editor", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  let widgetSet = false;
+  let widgetCleared = false;
+  let editorText = `analyze ${file}`;
+  try {
+    const ctx = makeCtx({ model: MULTIMODAL, cwd: dir }) as any;
+    ctx.hasUI = true;
+    ctx.ui.setWidget = (key: string, content: any) => {
+      if (content === undefined) widgetCleared = true;
+      else widgetSet = true;
+    };
+    ctx.ui.getEditorText = () => editorText;
+    ctx.ui.onTerminalInput = (handler: any) => { (ctx as any)._inputHandler = handler; return () => {}; };
+
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+    if ((ctx as any)._inputHandler) (ctx as any)._inputHandler("a");
+    await new Promise((r) => setTimeout(r, 400));
+    assert.ok(widgetSet, "widget set after typing a path");
+
+    editorText = "just a normal message now";
+    widgetCleared = false;
+    if ((ctx as any)._inputHandler) (ctx as any)._inputHandler("a");
+    await new Promise((r) => setTimeout(r, 400));
+    assert.ok(widgetCleared, "widget cleared after path removed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T40: /vision preview opens panel (TUI mode) ──
+test("T40: /vision preview <path> opens custom panel in TUI mode", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  let customCalled = false;
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: MULTIMODAL, cwd: dir }));
+    // Call the command handler directly (not via runVisionCommand which creates its own ctx)
+    const cmd = pi.commands.get("vision");
+    assert.ok(cmd, "/vision command registered");
+    const ctx = makeCtx({ model: MULTIMODAL, cwd: dir }) as any;
+    ctx.ui.custom = async (factory: any) => {
+      customCalled = true;
+      const component = factory({}, { fg: () => "styled" }, { matches: () => false }, () => {});
+      assert.ok(typeof component.render === "function", "factory returns a component with render()");
+      return undefined;
+    };
+    await cmd.handler(`preview ${file}`, ctx);
+    assert.ok(customCalled, "ctx.ui.custom called for /vision preview in TUI mode");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T41: /vision preview bad path → actionable error ──
+test("T41: /vision preview nonexistent path → notify error, no panel", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  let notified = "";
+  let customCalled = false;
+  try {
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: MULTIMODAL }));
+    const cmd = pi.commands.get("vision");
+    assert.ok(cmd, "/vision command registered");
+    const ctx = makeCtx({ model: MULTIMODAL }) as any;
+    ctx.ui.notify = (msg: string, type: string) => { notified = msg; };
+    ctx.ui.custom = async () => { customCalled = true; return undefined; };
+    await cmd.handler("preview /tmp/nonexistent-vision-test-12345.png", ctx);
+    assert.ok(notified.length > 0, "error notified");
+    assert.ok(!customCalled, "no panel opened for bad path");
+    assert.match(notified, /could not load image|not_found|error/i);
+  } finally {
+  }
+});
+
+// ── T42: compose preview disabled → no setWidget ──
+test("T42: composePreview disabled → no setWidget called", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  let widgetSet = false;
+  try {
+    const ctx = makeCtx({ model: MULTIMODAL, cwd: dir }) as any;
+    ctx.hasUI = true;
+    ctx.ui.setWidget = (key: string, content: any) => { if (content !== undefined) widgetSet = true; };
+    ctx.ui.getEditorText = () => `analyze ${file}`;
+    ctx.ui.onTerminalInput = (handler: any) => { (ctx as any)._inputHandler = handler; return () => {}; };
+
+    // Write config with composePreview: false
+    writeFileSync(join(TMP_AGENT, "vision.json"), JSON.stringify({
+      provider: "ollama", model: "minimax-m3:cloud", enabled: true,
+      composePreview: false,
+    }));
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+    if ((ctx as any)._inputHandler) (ctx as any)._inputHandler("a");
+    await new Promise((r) => setTimeout(r, 400));
+    assert.ok(!widgetSet, "no setWidget called when composePreview is disabled");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // Cleanup the temp agent dir after all tests.
 test("cleanup", () => {
   rmSync(TMP_AGENT, { recursive: true, force: true });
