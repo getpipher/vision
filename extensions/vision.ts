@@ -51,6 +51,7 @@ import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import { VisionCache } from "../lib/cache.ts";
 import { setSharedState } from "../lib/state.ts";
 import { createPreviewComponent, makePreviewImage, detectProtocol, formatImageMetadata } from "../lib/preview.ts";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { loadImage } from "../lib/image.ts";
 
 /** Current config. Loaded on session_start, mutated by /vision, saved to disk. */
@@ -766,7 +767,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
               },
               handleInput(data: string) {
                 // Close on Escape
-                if (data === "\x1b") {
+                if (data === "\x1b" || matchesKey(data, "escape") || matchesKey(data, "esc")) {
                   done(undefined);
                 }
               },
