@@ -113,10 +113,78 @@ export function renderMarkers(
 /**
  * Build the hint line appended in text-only + "hint" mode. Plain text (no
  * markdown, no ANSI) so the model reads it cleanly.
+ *
+ * v0.4.0 (SPEC-4 §3.4): now lists the image **paths** so the model can
+ * actually call `describe_image` (previously the hint named the tool but
+ * erased the paths via markers, leaving the model unable to invoke it).
+ * For N≥2 images, names the `image_paths` batch affordance so the model
+ * learns the batch tool exists. Paths are listed on indented lines so they
+ * are trivially extractable (regex `^  (.+)$`).
  */
-export function buildHintLine(imageCount: number): string {
-  const noun = imageCount === 1 ? "image" : "images";
-  return `[${imageCount} ${noun} referenced. The active model cannot process images natively — use the describe_image tool to analyze them.]`;
+export function buildHintLine(
+  images: Array<{ token: string; index: number }>,
+): string {
+  const n = images.length;
+  if (n === 0) {
+    return "0 images referenced.";
+  }
+  const noun = n === 1 ? "image" : "images";
+  const verb = n === 1 ? "analyze it" : "analyze them";
+  const clause = n >= 2 ? " (single, or pass all paths to image_paths for batch analysis)" : "";
+  const pathLines = images.map((img) => `  ${img.token}`).join("\n");
+  return `${n} ${noun} referenced. The active model cannot process images natively — use the describe_image tool to ${verb}${clause}.
+Image paths:
+${pathLines}`;
+}
+
+/** A per-image result for the batch tool-result builder. */
+export type BatchImageResult =
+  | { ok: true; text: string; cached: boolean; fallback: boolean; fallbackModel?: string }
+  | { ok: false; errorCode: string; message: string };
+
+/**
+ * Build the structured per-image tool-result text for a batch
+ * `describe_image` call (SPEC-4 §3.1.1). `results` must be in input order
+ * (matching `paths`); each entry is either a success (description) or a
+ * failure (sentinel — a failed image becomes an `[error: …]` section, never
+ * a whole-batch reject). The caller sets `isError` on the tool result only
+ * if **every** image failed.
+ *
+ * Pure: string in → string out.
+ */
+export function buildBatchToolResult(
+  paths: string[],
+  results: BatchImageResult[],
+): string {
+  if (paths.length === 0) {
+    return "[Batch: 0 image(s)]";
+  }
+  const lines: string[] = [`[Batch: ${paths.length} image(s)]`, ""];
+  for (let i = 0; i < paths.length; i++) {
+    const path = paths[i]!;
+    const r = results[i];
+    const header = `[Image ${i + 1}]`;
+    if (r && r.ok) {
+      const tags: string[] = [];
+      if (r.cached) tags.push("cached");
+      if (r.fallback) tags.push(`fallback: ${r.fallbackModel ?? "unknown"}`);
+      const tagStr = tags.length > 0 ? ` (${tags.join(", ")})` : "";
+      lines.push(`${header}${tagStr} ${path}`);
+      lines.push(r.text);
+      lines.push("");
+    } else if (r && !r.ok) {
+      lines.push(`${header} ${path}`);
+      lines.push(`[error: ${r.errorCode} — ${r.message}]`);
+      lines.push("");
+    } else {
+      // Defensive: result missing for this path (shouldn't happen — caller
+      // passes results aligned to paths).
+      lines.push(`${header} ${path}`);
+      lines.push("[error: unexpected — no result for this image]");
+      lines.push("");
+    }
+  }
+  return lines.join("\n").trimEnd();
 }
 
 /**

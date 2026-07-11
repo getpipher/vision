@@ -26,6 +26,11 @@ export type PasteMode = (typeof PASTE_MODES)[number];
 export const DEFAULT_AUTO_DELEGATE_PROMPT =
   "Describe this image concisely, focusing on visible content, text, diagrams, and layout.";
 
+/** Hard cap on the number of images a single `describe_image` batch call can
+ *  process. A safety bound, not a workflow knob — defends against an
+ *  over-eager model passing an absurd array. (SPEC-4 §3.5.) */
+export const MAX_BATCH_IMAGES = 50;
+
 export const REASONING_LEVELS: readonly ReasoningLevel[] = [
   "off",
   "minimal",
@@ -80,6 +85,10 @@ export interface VisionConfig {
   composePreview: boolean;
   /** Max width (in terminal cells) for the preview rendering. */
   previewMaxWidthCells: number;
+  // ── v0.4.0 (SPEC-4) ──────────────────────────────────────────────────────
+  /** Max number of image delegations to run in parallel (describe_image batch
+   *  + paste auto mode). 1 = serial (escape hatch). 20 = aggressive. */
+  batchConcurrency: number;
 }
 
 export const DEFAULT_CONFIG: VisionConfig = {
@@ -106,6 +115,8 @@ export const DEFAULT_CONFIG: VisionConfig = {
   // v0.3.3 defaults
   composePreview: true,
   previewMaxWidthCells: 80,
+  // v0.4.0 defaults
+  batchConcurrency: 5,
 };
 
 export const CONFIG_FILENAME = "vision.json";
@@ -166,10 +177,12 @@ export function mergeConfig(partial: unknown): VisionConfig {
     markerStyle: isMarkerStyle(p.markerStyle) ? p.markerStyle : DEFAULT_CONFIG.markerStyle,
     textOnlyPasteMode: isPasteMode(p.textOnlyPasteMode) ? p.textOnlyPasteMode : DEFAULT_CONFIG.textOnlyPasteMode,
     autoDelegatePrompt: strOrUndef(p.autoDelegatePrompt) ?? DEFAULT_CONFIG.autoDelegatePrompt,
-    autoDelegateTimeoutMs: clampInt(p.autoDelegateTimeoutMs, 5000, 120000, DEFAULT_CONFIG.autoDelegateTimeoutMs),
+    autoDelegateTimeoutMs: clampInt(p.autoDelegateTimeoutMs, 1000, 120000, DEFAULT_CONFIG.autoDelegateTimeoutMs),
     // v0.3.3 fields
     composePreview: typeof p.composePreview === "boolean" ? p.composePreview : DEFAULT_CONFIG.composePreview,
     previewMaxWidthCells: clampInt(p.previewMaxWidthCells, 20, 200, DEFAULT_CONFIG.previewMaxWidthCells),
+    // v0.4.0 fields
+    batchConcurrency: clampInt(p.batchConcurrency, 1, 20, DEFAULT_CONFIG.batchConcurrency),
   };
 }
 
@@ -282,7 +295,7 @@ export function applySettingChange(
     case "autoDelegateTimeoutMs": {
       const n = parseInt(value, 10);
       if (!Number.isFinite(n)) return config;
-      return { ...config, autoDelegateTimeoutMs: Math.min(120000, Math.max(5000, n)) };
+      return { ...config, autoDelegateTimeoutMs: Math.min(120000, Math.max(1000, n)) };
     }
     case "composePreview":
       return { ...config, composePreview: value === "on" };
@@ -290,6 +303,12 @@ export function applySettingChange(
       const n = parseInt(value, 10);
       if (!Number.isFinite(n)) return config;
       return { ...config, previewMaxWidthCells: Math.min(200, Math.max(20, n)) };
+    }
+    // ── v0.4.0 fields ────────────────────────────────────────────────────
+    case "batchConcurrency": {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, batchConcurrency: Math.min(20, Math.max(1, n)) };
     }
     default:
       return config;

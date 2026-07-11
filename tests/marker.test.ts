@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildDescriptionsBlock,
   buildHintLine,
+  buildBatchToolResult,
   isMarkerStyle,
   MARKER_STYLES,
   renderMarkers,
@@ -156,27 +157,125 @@ test("renderMarkers: empty text", () => {
   assert.equal(out, "");
 });
 
-// ── buildHintLine ────────────────────────────────────────────────────────
+// ── buildHintLine (v0.4.0: lists paths + names batch affordance) ───────────
 
-test("buildHintLine: singular", () => {
-  const line = buildHintLine(1);
-  assert.equal(
-    line,
-    "[1 image referenced. The active model cannot process images natively — use the describe_image tool to analyze them.]",
-  );
+test("buildHintLine: single image → singular noun, one path, no batch clause", () => {
+  const line = buildHintLine([{ token: "/tmp/a.png", index: 0 }]);
+  assert.ok(line.startsWith("1 image referenced."), "singular noun");
+  assert.ok(line.includes("analyze it."), "singular verb");
+  assert.ok(!line.includes("image_paths"), "no batch affordance for 1 image");
+  assert.ok(line.includes("  /tmp/a.png"), "path listed indented");
 });
 
-test("buildHintLine: plural", () => {
-  const line = buildHintLine(3);
-  assert.equal(
-    line,
-    "[3 images referenced. The active model cannot process images natively — use the describe_image tool to analyze them.]",
-  );
+test("buildHintLine: multiple images → plural noun, N paths, batch affordance", () => {
+  const line = buildHintLine([
+    { token: "/tmp/a.png", index: 0 },
+    { token: "/tmp/b.jpeg", index: 1 },
+  ]);
+  assert.ok(line.startsWith("2 images referenced."), "plural noun");
+  assert.ok(line.includes("analyze them"), "plural verb");
+  assert.ok(line.includes("image_paths"), "names the batch affordance");
+  assert.ok(line.includes("  /tmp/a.png"), "path 1 listed");
+  assert.ok(line.includes("  /tmp/b.jpeg"), "path 2 listed");
 });
 
-test("buildHintLine: zero (edge case)", () => {
-  const line = buildHintLine(0);
-  assert.ok(line.includes("0 images referenced"));
+test("buildHintLine: zero images (defensive)", () => {
+  const line = buildHintLine([]);
+  assert.equal(line, "0 images referenced.");
+});
+
+test("buildHintLine: paths are extractable via regex", () => {
+  const line = buildHintLine([
+    { token: "/tmp/a.png", index: 0 },
+    { token: "/tmp/pi-clipboard-3f1c.png", index: 1 },
+  ]);
+  const paths = [...line.matchAll(/^  (.+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(paths, ["/tmp/a.png", "/tmp/pi-clipboard-3f1c.png"]);
+});
+
+test("buildHintLine: preserves token order (index not used for ordering)", () => {
+  // The caller passes tokens in marker order; output lists them in that order.
+  const line = buildHintLine([
+    { token: "/tmp/first.png", index: 0 },
+    { token: "/tmp/second.png", index: 1 },
+  ]);
+  const firstIdx = line.indexOf("/tmp/first.png");
+  const secondIdx = line.indexOf("/tmp/second.png");
+  assert.ok(firstIdx < secondIdx && firstIdx > -1, "first before second");
+});
+
+// ── buildBatchToolResult (v0.4.0: structured per-image tool result) ───────
+
+test("buildBatchToolResult: header + per-image sections in input order", () => {
+  const out = buildBatchToolResult(
+    ["/tmp/a.png", "/tmp/b.jpeg", "/tmp/c.png"],
+    [
+      { ok: true, text: "A red square.", cached: false, fallback: false },
+      { ok: true, text: "A blue circle.", cached: false, fallback: false },
+      { ok: true, text: "A green triangle.", cached: false, fallback: false },
+    ],
+  );
+  assert.ok(out.startsWith("[Batch: 3 image(s)]"), "header with count");
+  assert.ok(out.includes("[Image 1] /tmp/a.png"), "image 1 header");
+  assert.ok(out.includes("[Image 2] /tmp/b.jpeg"), "image 2 header");
+  assert.ok(out.includes("[Image 3] /tmp/c.png"), "image 3 header");
+  assert.ok(out.includes("A red square."));
+  assert.ok(out.includes("A blue circle."));
+  assert.ok(out.includes("A green triangle."));
+  // Order check: image 1 before 2 before 3
+  const i1 = out.indexOf("[Image 1]");
+  const i2 = out.indexOf("[Image 2]");
+  const i3 = out.indexOf("[Image 3]");
+  assert.ok(i1 < i2 && i2 < i3, "sections in input order");
+});
+
+test("buildBatchToolResult: cached tag", () => {
+  const out = buildBatchToolResult(
+    ["/tmp/a.png"],
+    [{ ok: true, text: "desc", cached: true, fallback: false }],
+  );
+  assert.ok(out.includes("[Image 1] (cached) /tmp/a.png"), "cached tag on header");
+});
+
+test("buildBatchToolResult: fallback tag includes model", () => {
+  const out = buildBatchToolResult(
+    ["/tmp/a.png"],
+    [{ ok: true, text: "desc", cached: false, fallback: true, fallbackModel: "ollama/glm4v:cloud" }],
+  );
+  assert.ok(out.includes("[Image 1] (fallback: ollama/glm4v:cloud) /tmp/a.png"), "fallback tag with model");
+});
+
+test("buildBatchToolResult: failed image → [error: code — message] section, not whole-batch fail", () => {
+  const out = buildBatchToolResult(
+    ["/tmp/good.png", "/tmp/bad.png", "/tmp/good2.png"],
+    [
+      { ok: true, text: "good 1", cached: false, fallback: false },
+      { ok: false, errorCode: "not_found", message: "image not found at /tmp/bad.png" },
+      { ok: true, text: "good 2", cached: false, fallback: false },
+    ],
+  );
+  assert.ok(out.includes("[Image 2] /tmp/bad.png"), "failed image header present");
+  assert.ok(out.includes("[error: not_found — image not found at /tmp/bad.png]"), "error section");
+  assert.ok(out.includes("good 1") && out.includes("good 2"), "successful descriptions preserved");
+});
+
+test("buildBatchToolResult: all fail → still returns full text (caller sets isError)", () => {
+  const out = buildBatchToolResult(
+    ["/tmp/bad1.png", "/tmp/bad2.png"],
+    [
+      { ok: false, errorCode: "not_found", message: "missing 1" },
+      { ok: false, errorCode: "read_error", message: "missing 2" },
+    ],
+  );
+  assert.ok(out.startsWith("[Batch: 2 image(s)]"));
+  assert.ok(out.includes("[error: not_found — missing 1]"));
+  assert.ok(out.includes("[error: read_error — missing 2]"));
+});
+
+test("buildBatchToolResult: empty paths (defensive)", () => {
+  const out = buildBatchToolResult([], []);
+  assert.ok(out.startsWith("["), "returns something non-empty for safety");
+  assert.ok(!out.includes("[Image"), "no per-image sections for empty input");
 });
 
 // ── buildDescriptionsBlock ──────────────────────────────────────────────

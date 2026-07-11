@@ -12,6 +12,7 @@ import {
   mergeConfig,
   saveConfig,
   applySettingChange,
+  MAX_BATCH_IMAGES,
 } from "../lib/config.ts";
 
 function tmpAgentDir(): string {
@@ -40,6 +41,7 @@ test("DEFAULT_CONFIG has the expected shape", () => {
     autoDelegateTimeoutMs: 30000,
     composePreview: true,
     previewMaxWidthCells: 80,
+    batchConcurrency: 5,
   });
 });
 
@@ -359,8 +361,8 @@ test("mergeConfig: empty autoDelegatePrompt → default", () => {
   assert.equal(mergeConfig({ autoDelegatePrompt: "  " }).autoDelegatePrompt, DEFAULT_CONFIG.autoDelegatePrompt);
 });
 
-test("mergeConfig: clamps autoDelegateTimeoutMs to [5000, 120000]", () => {
-  assert.equal(mergeConfig({ autoDelegateTimeoutMs: 1000 }).autoDelegateTimeoutMs, 5000);
+test("mergeConfig: clamps autoDelegateTimeoutMs to [1000, 120000]", () => {
+  assert.equal(mergeConfig({ autoDelegateTimeoutMs: 500 }).autoDelegateTimeoutMs, 1000);
   assert.equal(mergeConfig({ autoDelegateTimeoutMs: 999999 }).autoDelegateTimeoutMs, 120000);
 });
 
@@ -389,7 +391,7 @@ test("applySettingChange: autoDelegatePrompt set / empty → default", () => {
 
 test("applySettingChange: autoDelegateTimeoutMs parse + clamp", () => {
   assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "60000").autoDelegateTimeoutMs, 60000);
-  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "1000").autoDelegateTimeoutMs, 5000);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "500").autoDelegateTimeoutMs, 1000);
   assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "999999").autoDelegateTimeoutMs, 120000);
 });
 
@@ -426,4 +428,64 @@ test("applySettingChange: previewMaxWidthCells parse + clamp", () => {
   assert.equal(applySettingChange(DEFAULT_CONFIG, "previewMaxWidthCells", "100").previewMaxWidthCells, 100);
   assert.equal(applySettingChange(DEFAULT_CONFIG, "previewMaxWidthCells", "10").previewMaxWidthCells, 20);
   assert.equal(applySettingChange(DEFAULT_CONFIG, "previewMaxWidthCells", "999").previewMaxWidthCells, 200);
+});
+
+// ── v0.4.0: batchConcurrency + MAX_BATCH_IMAGES ─────────────────────────────
+
+test("MAX_BATCH_IMAGES is exported and equals 50", () => {
+  assert.equal(MAX_BATCH_IMAGES, 50);
+});
+
+test("mergeConfig: batchConcurrency default is 5", () => {
+  assert.equal(mergeConfig({}).batchConcurrency, 5);
+});
+
+test("mergeConfig: batchConcurrency clamps low to 1", () => {
+  assert.equal(mergeConfig({ batchConcurrency: 0 }).batchConcurrency, 1);
+  assert.equal(mergeConfig({ batchConcurrency: -5 }).batchConcurrency, 1);
+});
+
+test("mergeConfig: batchConcurrency clamps high to 20", () => {
+  assert.equal(mergeConfig({ batchConcurrency: 99 }).batchConcurrency, 20);
+  assert.equal(mergeConfig({ batchConcurrency: 50 }).batchConcurrency, 20);
+});
+
+test("mergeConfig: batchConcurrency accepts string numbers", () => {
+  assert.equal(mergeConfig({ batchConcurrency: "3" }).batchConcurrency, 3);
+});
+
+test("mergeConfig: batchConcurrency non-number → default 5", () => {
+  assert.equal(mergeConfig({ batchConcurrency: "abc" }).batchConcurrency, 5);
+});
+
+test("mergeConfig: batchConcurrency null → clamped to 1 (matches clampInt behavior for all numeric fields)", () => {
+  // Number(null) === 0 → clamped to min. Consistent with maxDimension/retryAttempts/etc.
+  assert.equal(mergeConfig({ batchConcurrency: null }).batchConcurrency, 1);
+});
+
+test("mergeConfig: batchConcurrency rounds fractional values", () => {
+  assert.equal(mergeConfig({ batchConcurrency: 2.9 }).batchConcurrency, 3);
+});
+
+test("applySettingChange: batchConcurrency parse + clamp", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "batchConcurrency", "10").batchConcurrency, 10);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "batchConcurrency", "0").batchConcurrency, 1);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "batchConcurrency", "999").batchConcurrency, 20);
+});
+
+test("applySettingChange: batchConcurrency non-numeric → unchanged", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "batchConcurrency", "abc").batchConcurrency, 5);
+});
+
+test("mergeConfig: v0.3.x config loads with batchConcurrency default (forward-compat)", () => {
+  const v03 = mergeConfig({
+    provider: "ollama",
+    model: "minimax-m3:cloud",
+    markerStyle: "bold",
+    textOnlyPasteMode: "auto",
+    composePreview: false,
+    // no batchConcurrency
+  });
+  assert.equal(v03.batchConcurrency, 5, "v0.3.x config gets v0.4.0 default");
+  assert.equal(v03.markerStyle, "bold");
 });
