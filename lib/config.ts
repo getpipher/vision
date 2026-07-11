@@ -75,6 +75,11 @@ export interface VisionConfig {
   autoDelegatePrompt: string;
   /** Timeout (ms) for auto-delegation in the input hook (own AbortController). */
   autoDelegateTimeoutMs: number;
+  // ── v0.3.3 (SPEC-3 gap #7) ───────────────────────────────────────────
+  /** When true, compose-time auto-preview shows images above the editor while typing. */
+  composePreview: boolean;
+  /** Max width (in terminal cells) for the preview rendering. */
+  previewMaxWidthCells: number;
 }
 
 export const DEFAULT_CONFIG: VisionConfig = {
@@ -98,6 +103,9 @@ export const DEFAULT_CONFIG: VisionConfig = {
   textOnlyPasteMode: "hint",
   autoDelegatePrompt: DEFAULT_AUTO_DELEGATE_PROMPT,
   autoDelegateTimeoutMs: 30000,
+  // v0.3.3 defaults
+  composePreview: true,
+  previewMaxWidthCells: 80,
 };
 
 export const CONFIG_FILENAME = "vision.json";
@@ -159,6 +167,9 @@ export function mergeConfig(partial: unknown): VisionConfig {
     textOnlyPasteMode: isPasteMode(p.textOnlyPasteMode) ? p.textOnlyPasteMode : DEFAULT_CONFIG.textOnlyPasteMode,
     autoDelegatePrompt: strOrUndef(p.autoDelegatePrompt) ?? DEFAULT_CONFIG.autoDelegatePrompt,
     autoDelegateTimeoutMs: clampInt(p.autoDelegateTimeoutMs, 5000, 120000, DEFAULT_CONFIG.autoDelegateTimeoutMs),
+    // v0.3.3 fields
+    composePreview: typeof p.composePreview === "boolean" ? p.composePreview : DEFAULT_CONFIG.composePreview,
+    previewMaxWidthCells: clampInt(p.previewMaxWidthCells, 20, 200, DEFAULT_CONFIG.previewMaxWidthCells),
   };
 }
 
@@ -272,6 +283,13 @@ export function applySettingChange(
       const n = parseInt(value, 10);
       if (!Number.isFinite(n)) return config;
       return { ...config, autoDelegateTimeoutMs: Math.min(120000, Math.max(5000, n)) };
+    }
+    case "composePreview":
+      return { ...config, composePreview: value === "on" };
+    case "previewMaxWidthCells": {
+      const n = parseInt(value, 10);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, previewMaxWidthCells: Math.min(200, Math.max(20, n)) };
     }
     default:
       return config;

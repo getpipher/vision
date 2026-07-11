@@ -38,6 +38,8 @@ test("DEFAULT_CONFIG has the expected shape", () => {
     textOnlyPasteMode: "hint",
     autoDelegatePrompt: "Describe this image concisely, focusing on visible content, text, diagrams, and layout.",
     autoDelegateTimeoutMs: 30000,
+    composePreview: true,
+    previewMaxWidthCells: 80,
   });
 });
 
@@ -389,4 +391,39 @@ test("applySettingChange: autoDelegateTimeoutMs parse + clamp", () => {
   assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "60000").autoDelegateTimeoutMs, 60000);
   assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "1000").autoDelegateTimeoutMs, 5000);
   assert.equal(applySettingChange(DEFAULT_CONFIG, "autoDelegateTimeoutMs", "999999").autoDelegateTimeoutMs, 120000);
+});
+
+
+// ── v0.3.3 (SPEC-3 gap #7) fields ────────────────────────────────────────
+
+test("mergeConfig: v0.3.3 fields default when missing (forward-compat from v0.3.2)", () => {
+  const v032 = mergeConfig({ provider: "ollama", model: "m", enabled: true });
+  assert.equal(v032.composePreview, true);
+  assert.equal(v032.previewMaxWidthCells, 80);
+});
+
+test("mergeConfig: v0.3.3 fields pass through + validate", () => {
+  const c = mergeConfig({ composePreview: false, previewMaxWidthCells: 120 });
+  assert.equal(c.composePreview, false);
+  assert.equal(c.previewMaxWidthCells, 120);
+});
+
+test("mergeConfig: non-boolean composePreview → default true", () => {
+  assert.equal(mergeConfig({ composePreview: "yes" }).composePreview, true);
+});
+
+test("mergeConfig: clamps previewMaxWidthCells to [20, 200]", () => {
+  assert.equal(mergeConfig({ previewMaxWidthCells: 5 }).previewMaxWidthCells, 20);
+  assert.equal(mergeConfig({ previewMaxWidthCells: 500 }).previewMaxWidthCells, 200);
+});
+
+test("applySettingChange: composePreview on/off", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "composePreview", "off").composePreview, false);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "composePreview", "on").composePreview, true);
+});
+
+test("applySettingChange: previewMaxWidthCells parse + clamp", () => {
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "previewMaxWidthCells", "100").previewMaxWidthCells, 100);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "previewMaxWidthCells", "10").previewMaxWidthCells, 20);
+  assert.equal(applySettingChange(DEFAULT_CONFIG, "previewMaxWidthCells", "999").previewMaxWidthCells, 200);
 });
