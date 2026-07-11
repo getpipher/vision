@@ -451,7 +451,7 @@ function buildAutoPromptInput(
  *  `string | string[] | undefined` for both fields. Merges image_paths first
  *  (the batch field) then image_path, filters empties, dedups case-sensitively
  *  preserving first-occurrence order. (SPEC-4 §3.1, PLAN-4 §1.1/§1.6.) */
-function normalizeImagePaths(params: {
+export function normalizeImagePaths(params: {
   image_path?: string | string[];
   image_paths?: string | string[];
 }): string[] {

@@ -1181,8 +1181,8 @@ test("T44: describe_image 10 images, batchConcurrency=5 → 2 waves, maxObserved
     assert.equal(res.details.mode, "delegate-batch");
     assert.equal(res.details.batch.length, 10);
     // ★ GATE: concurrency bounded to 5 (10 images / 5 = 2 waves)
-    assert.ok(maxObserved <= 5, `★ maxObserved=${maxObserved} should be <= 5 (bounded)`);
-    assert.ok(maxObserved >= 1, "at least 1 observed");
+    assert.ok(maxObserved <= 5, `★ bound: maxObserved=${maxObserved} should be <= 5`);
+    assert.ok(maxObserved >= 4, `★ parallel: maxObserved=${maxObserved} should be >= 4 (rules out serial)`);
     assert.equal(res.isError, undefined);
   } finally {
     globalThis.fetch = original;

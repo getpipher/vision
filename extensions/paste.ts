@@ -36,7 +36,6 @@ import { getSharedConfig, getSharedCache } from "../lib/state.ts";
 import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import type { ReasoningLevel } from "../lib/config.ts";
 import { createComposePreviewComponent, makePreviewImage } from "../lib/preview.ts";
-import { clearSharedState } from "../lib/state.ts";
 import { mapWithConcurrency } from "../lib/batch.ts";
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
