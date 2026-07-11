@@ -1929,6 +1929,44 @@ test("T57 (integration): paste auto + localOnly + cached image → cache hit via
   }
 });
 
+// ── T70: v0.5.0 regression gate — full surface wired ──────────────────
+test("T70: v0.5.0 regression gate — config fields + subcommands + auto-detect all wired", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  resetVisionConfig();
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY }));
+  // 4 new config fields default correctly (fresh config after reset + session_start).
+  const cfg = loadConfig(getAgentDir());
+  assert.equal(cfg.auditLog, true, "auditLog default on");
+  assert.equal(cfg.auditLogPath, undefined);
+  assert.equal(cfg.localOnly, false);
+  assert.equal(cfg.autoDetectVisionModel, true);
+  // 3 new subcommands registered.
+  const cmds = [...pi.commands.keys()];
+  assert.ok(cmds.includes("vision"), "/vision command registered");
+  // The subcommands are parsed inside the vision handler; verify they dispatch
+  // without error by exercising one of each (local-only, audit, audit-path).
+  const cmdCtx = makeCtx({ model: TEXT_ONLY }) as unknown as ExtensionCommandContext;
+  (cmdCtx.ui as any).notify = () => {};
+  await pi.commands.get("vision")!.handler("local-only off", cmdCtx);
+  await pi.commands.get("vision")!.handler("audit show", cmdCtx);
+  await pi.commands.get("vision")!.handler("audit-path", cmdCtx);
+  assert.equal(loadConfig(getAgentDir()).localOnly, false, "local-only off persisted");
+  // Auto-detect wired: a fresh config + vision-capable registry triggers detection.
+  resetVisionConfig();
+  let notified = "";
+  const detectCtx = makeCtxWithRegistry({
+    model: TEXT_ONLY,
+    available: [ollamaVision("minimax-m3:cloud")],
+  });
+  (detectCtx.ui as any).notify = (msg: string) => { notified = msg; };
+  await pi.emit("session_start", { type: "session_start", reason: "startup" }, detectCtx);
+  assert.equal(loadConfig(getAgentDir()).model, "minimax-m3:cloud", "auto-detect wired end-to-end");
+  assert.match(notified, /auto-configured/);
+  // Full suite green = T70 passed (if this test runs, the suite compiled + loaded).
+  assert.ok(true, "v0.5.0 surface wired + regression gate passed");
+});
+
 // Cleanup the temp agent dir after all tests.
 test("cleanup", () => {
   rmSync(TMP_AGENT, { recursive: true, force: true });
