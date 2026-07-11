@@ -131,6 +131,34 @@ primaries.
     on timeout or failure.
   - **off**: markers only — no attachment, no hint, no delegation.
 
+## Image Preview (v0.3.3)
+
+`@getpipher/vision` can render images directly in the terminal — no external
+viewer needed.
+
+**Compose-time auto-preview.** As you type a message referencing an image
+path, the image renders **above the editor** (WhatsApp/Telegram compose-box
+style) ~300ms after you stop typing. Clears when you remove the path or
+submit the message. Enable/disable via the `/vision` panel
+(**Compose preview** row) or the config field `composePreview`.
+
+**On-demand preview.** `/vision preview <path>` opens a full panel showing
+the image + metadata (filename, dimensions, MIME, file size, detected
+protocol). Useful for checking an image before deciding to analyze it.
+
+**Terminal support:**
+
+| Terminal | Image rendering |
+|---|---|
+| Kitty, Ghostty, WezTerm, Warp (standalone) | ✅ Real graphics (Kitty protocol) |
+| iTerm2 (standalone) | ✅ Real graphics (iTerm2 protocol) |
+| tmux (any terminal) | Text fallback (`[Image: filename image/png WxH]`) |
+| VSCode, Alacritty, other | Text fallback |
+
+The text fallback still shows useful metadata (filename, dimensions, format,
+file size) and confirms the image was found. Real graphics require running pi
+outside tmux on a graphics-capable terminal.
+
 ## How it works
 
 Two mechanisms combine to guarantee the behavior:

@@ -50,6 +50,8 @@ import {
 import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import { VisionCache } from "../lib/cache.ts";
 import { setSharedState } from "../lib/state.ts";
+import { createPreviewComponent, makePreviewImage, detectProtocol, formatImageMetadata } from "../lib/preview.ts";
+import { loadImage } from "../lib/image.ts";
 
 /** Current config. Loaded on session_start, mutated by /vision, saved to disk. */
 let config: VisionConfig = { ...DEFAULT_CONFIG };
@@ -80,6 +82,7 @@ const SUBCOMMANDS = [
   "paste-mode",
   "marker-style",
   "auto-prompt",
+  "preview",
 ] as const;
 
 function formatConfigStatus(c: VisionConfig): string {
@@ -99,6 +102,8 @@ function formatConfigStatus(c: VisionConfig): string {
     `  textOnlyPaste:   ${c.textOnlyPasteMode}`,
     `  autoPrompt:      ${c.autoDelegatePrompt ? truncatePreview(c.autoDelegatePrompt, 40) : "(default)"}`,
     `  autoTimeout:     ${c.autoDelegateTimeoutMs}ms`,
+    `  composePreview:  ${c.composePreview}`,
+    `  previewMaxWidth: ${c.previewMaxWidthCells} cells`,
   ].join("\n");
 }
 
@@ -143,6 +148,10 @@ function renderValue(id: string): string {
       return config.autoDelegatePrompt ? truncatePreview(config.autoDelegatePrompt, 40) : "(default)";
     case "autoDelegateTimeoutMs":
       return `${config.autoDelegateTimeoutMs}ms`;
+    case "composePreview":
+      return config.composePreview ? "on" : "off";
+    case "previewMaxWidthCells":
+      return `${config.previewMaxWidthCells}`;
     default:
       return "";
   }
@@ -317,6 +326,21 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
         currentValue: renderValue("autoDelegateTimeoutMs"),
         values: ["10000ms", "20000ms", "30000ms", "60000ms"],
         description: "Timeout for auto-delegation in the paste hook (per-image AbortController). Falls back to hint on timeout.",
+      },
+      // ── v0.3.3 (SPEC-3 gap #7) rows ──────────────────────────────────────
+      {
+        id: "composePreview",
+        label: "Compose preview",
+        currentValue: renderValue("composePreview"),
+        values: ["on", "off"],
+        description: "When on, images preview above the editor as you type a path (WhatsApp style). Text fallback on tmux/unsupported terminals.",
+      },
+      {
+        id: "previewMaxWidthCells",
+        label: "Preview max width",
+        currentValue: renderValue("previewMaxWidthCells"),
+        values: ["40", "60", "80", "100", "120"],
+        description: "Max width (in terminal cells) for the image preview rendering.",
       },
     ];
 
@@ -705,6 +729,52 @@ export default function visionExtension(pi: ExtensionAPI): void {
           saveConfig(config, agentDir);
           setSharedState(config, cache);
           ctx.ui.notify(config.autoDelegatePrompt === DEFAULT_CONFIG.autoDelegatePrompt ? "Auto-delegate prompt reset to default." : "Auto-delegate prompt set.", "info");
+          return;
+        }
+        case "preview": {
+          const path = parts.slice(1).join(" ").trim();
+          if (!path) {
+            ctx.ui.notify("Usage: /vision preview <image-path>", "warning");
+            return;
+          }
+          if (ctx.mode !== "tui") {
+            // Non-TUI: notify metadata as text
+            const loaded = await loadImage(path, { compress: false, maxDimension: 1568, jpegQuality: 85, cwd: ctx.cwd });
+            if (!loaded.ok) {
+              ctx.ui.notify(`Vision preview error: could not load image "${path}".`, "error");
+              return;
+            }
+            const img = makePreviewImage(loaded.image.data, loaded.image.mimeType, path);
+            ctx.ui.notify(formatImageMetadata(img, detectProtocol()), "info");
+            return;
+          }
+          // TUI: open a custom panel with the Image component
+          const loaded = await loadImage(path, { compress: false, maxDimension: 1568, jpegQuality: 85, cwd: ctx.cwd });
+          if (!loaded.ok) {
+            ctx.ui.notify(`Vision preview error: could not load image "${path}" (${loaded.error.code}).`, "error");
+            return;
+          }
+          const img = makePreviewImage(loaded.image.data, loaded.image.mimeType, path);
+          await ctx.ui.custom((_tui, theme, keybindings, done) => {
+            const component = createPreviewComponent(img, (c: string, t: string) => theme.fg(c as any, t), config.previewMaxWidthCells);
+            return {
+              render(width: number) {
+                return component.render(width);
+              },
+              invalidate() {
+                component.invalidate();
+              },
+              handleInput(data: string) {
+                // Close on Escape
+                if (data === "\x1b") {
+                  done(undefined);
+                }
+              },
+              dispose() {
+                component.dispose?.();
+              },
+            } as Component & { dispose?(): void };
+          });
           return;
         }
         default: {

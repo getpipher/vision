@@ -35,6 +35,8 @@ import { renderMarkers, buildHintLine, buildDescriptionsBlock } from "../lib/mar
 import { getSharedConfig, getSharedCache } from "../lib/state.ts";
 import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import type { ReasoningLevel } from "../lib/config.ts";
+import { createComposePreviewComponent, makePreviewImage } from "../lib/preview.ts";
+import { clearSharedState } from "../lib/state.ts";
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 // Matches path-like tokens (absolute /…, home ~/…, relative ./…/…/) ending in a
@@ -201,8 +203,110 @@ async function autoDelegateOne(
   }
 }
 
+/** Debounce timer for compose-time preview. */
+let composeDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+/** Unsubscribe function for the onTerminalInput handler. */
+let terminalInputUnsub: (() => void) | undefined;
+/** The last set of tokens we previewed (to avoid re-rendering the same). */
+let lastPreviewTokens: string = "";
+
+/**
+ * Compose-time auto-preview: while the user is typing, detect image paths in
+ * the editor text and render a preview above the editor (WhatsApp style).
+ * Debounced ~300ms after the last keystroke. Clears on submit or path removal.
+ */
+async function updateComposePreview(ctx: ExtensionContext): Promise<void> {
+  const config = getSharedConfig();
+  if (!config || !config.composePreview) {
+    ctx.ui.setWidget("vision-compose-preview", undefined);
+    return;
+  }
+  if (ctx.mode !== "tui") return; // widget is TUI-only
+
+  const editorText = ctx.ui.getEditorText();
+  const tokens = findImagePathTokens(editorText);
+  const tokensKey = tokens.join("\0");
+
+  if (tokens.length === 0) {
+    if (lastPreviewTokens) {
+      ctx.ui.setWidget("vision-compose-preview", undefined);
+      lastPreviewTokens = "";
+    }
+    return;
+  }
+
+  // Skip if same tokens as last time (no re-render needed)
+  if (tokensKey === lastPreviewTokens) return;
+  lastPreviewTokens = tokensKey;
+
+  // Resolve + load each token (compress: false — show original quality)
+  const previewImages: ReturnType<typeof makePreviewImage>[] = [];
+  for (const token of tokens) {
+    const unescaped = token.replace(/\\ /g, " ");
+    const abs = isAbsolute(unescaped) ? unescaped : resolvePath(ctx.cwd, unescaped);
+    if (!existsSync(abs)) continue;
+    const result = await loadImage(abs, {
+      compress: false,
+      maxDimension: 1568,
+      jpegQuality: 85,
+      cwd: ctx.cwd,
+    });
+    if (!result.ok) continue;
+    previewImages.push(makePreviewImage(result.image.data, result.image.mimeType, abs));
+  }
+
+  if (previewImages.length === 0) {
+    ctx.ui.setWidget("vision-compose-preview", undefined);
+    return;
+  }
+
+  // Set the widget above the editor
+  ctx.ui.setWidget(
+    "vision-compose-preview",
+    (tui, theme) => createComposePreviewComponent(
+      previewImages,
+      (c: string, t: string) => theme.fg(c as any, t),
+      config.previewMaxWidthCells,
+    ),
+    { placement: "aboveEditor" },
+  );
+}
+
 export default function pasteExtension(_pi: ExtensionAPI): void {
+  // ── Compose-time auto-preview (gap #7) ───────────────────────────────────
+  _pi.on("session_start", (_event, ctx) => {
+    // Register terminal input listener for compose-time preview
+    if (terminalInputUnsub) terminalInputUnsub();
+    if (ctx.hasUI && ctx.mode === "tui") {
+      terminalInputUnsub = ctx.ui.onTerminalInput((_data: string) => {
+        // Debounce: clear existing timer, set new one
+        if (composeDebounceTimer) clearTimeout(composeDebounceTimer);
+        composeDebounceTimer = setTimeout(() => {
+          updateComposePreview(ctx).catch(() => {});
+        }, 300);
+        return undefined; // don't consume — let the editor process normally
+      });
+    }
+  });
+
+  _pi.on("session_shutdown", () => {
+    if (composeDebounceTimer) {
+      clearTimeout(composeDebounceTimer);
+      composeDebounceTimer = undefined;
+    }
+    if (terminalInputUnsub) {
+      terminalInputUnsub();
+      terminalInputUnsub = undefined;
+    }
+    lastPreviewTokens = "";
+  });
+
   _pi.on("input", async (event, ctx) => {
+    // Clear compose preview on submit (only if setWidget is available — TUI mode)
+    if (event.source !== "extension" && typeof ctx.ui.setWidget === "function") {
+      ctx.ui.setWidget("vision-compose-preview", undefined);
+      lastPreviewTokens = "";
+    }
     // Don't re-process messages we (or another extension) injected.
     if (event.source === "extension") return { action: "continue" as const };
 
