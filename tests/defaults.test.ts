@@ -40,8 +40,6 @@ test("no vision models → all undefined (no-op)", () => {
   ]);
   assert.equal(result.provider, undefined);
   assert.equal(result.model, undefined);
-  assert.equal(result.fallbackProvider, undefined);
-  assert.equal(result.fallbackModel, undefined);
 });
 
 test("only Ollama vision models → primary = first by sorted id, no fallback", () => {
@@ -51,19 +49,18 @@ test("only Ollama vision models → primary = first by sorted id, no fallback", 
   ]);
   assert.equal(result.provider, "Ollama");
   assert.equal(result.model, "minimax-m3:cloud", "sorted by id: minimax < qwen");
-  assert.equal(result.fallbackProvider, undefined, "no other provider → no fallback");
-  assert.equal(result.fallbackModel, undefined);
 });
 
-test("Ollama + OpenRouter vision → primary Ollama, fallback OpenRouter (frontier escalation)", () => {
+test("Ollama + OpenRouter vision → primary Ollama, NO auto-fallback (v0.5.1: user sets fallback explicitly)", () => {
   const result = autoDetectDefaults([
     vision("Ollama", "minimax-m3:cloud"),
     vision("OpenRouter", "gpt-4o"),
   ]);
   assert.equal(result.provider, "Ollama");
   assert.equal(result.model, "minimax-m3:cloud");
-  assert.equal(result.fallbackProvider, "OpenRouter");
-  assert.equal(result.fallbackModel, "gpt-4o");
+  // v0.5.1: auto-detect returns ONLY the primary. No fallback fields.
+  assert.equal("fallbackProvider" in result, false, "no fallback field in DetectedDefaults");
+  assert.equal("fallbackModel" in result, false);
 });
 
 test("no Ollama vision, but OpenRouter vision → primary = first OpenRouter vision", () => {
@@ -73,9 +70,6 @@ test("no Ollama vision, but OpenRouter vision → primary = first OpenRouter vis
   ]);
   assert.equal(result.provider, "OpenRouter");
   assert.equal(result.model, "claude-sonnet", "sorted by id: claude < gpt");
-  // Fallback: only OpenRouter has vision → no different-provider fallback.
-  assert.equal(result.fallbackProvider, undefined);
-  assert.equal(result.fallbackModel, undefined);
 });
 
 test("only one provider with vision → fallback undefined (no other provider)", () => {
@@ -87,22 +81,17 @@ test("only one provider with vision → fallback undefined (no other provider)",
   ]);
   assert.equal(result.provider, "Ollama");
   assert.equal(result.model, "minimax-m3:cloud");
-  assert.equal(result.fallbackProvider, undefined);
-  assert.equal(result.fallbackModel, undefined);
 });
 
-test("three providers with vision → fallback = first non-primary-provider vision", () => {
+test("three providers with vision → primary Ollama (v0.5.1: no auto-fallback)", () => {
   const result = autoDetectDefaults([
     vision("Ollama", "minimax-m3:cloud"),
     vision("OpenRouter", "gpt-4o"),
     vision("Anthropic", "claude-sonnet"),
   ]);
-  // Primary: Ollama (preferred). Fallback: first non-Ollama vision by sort
-  // → Anthropic/claude-sonnet (Anthropic < OpenRouter).
   assert.equal(result.provider, "Ollama");
   assert.equal(result.model, "minimax-m3:cloud");
-  assert.equal(result.fallbackProvider, "Anthropic");
-  assert.equal(result.fallbackModel, "claude-sonnet");
+  assert.equal("fallbackProvider" in result, false, "v0.5.1: no fallback field");
 });
 
 test("determinism: shuffled input → same output (sort normalizes)", () => {
@@ -118,7 +107,6 @@ test("determinism: shuffled input → same output (sort normalizes)", () => {
   assert.deepEqual(a, b);
   assert.deepEqual(a, c);
   assert.equal(a.model, "minimax-m3:cloud");
-  assert.equal(a.fallbackModel, "gpt-4o");
 });
 
 test(":cloud preference is implicit (sort by id), not a separate filter", () => {
@@ -138,8 +126,6 @@ test("empty input → all undefined", () => {
   const result = autoDetectDefaults([]);
   assert.equal(result.provider, undefined);
   assert.equal(result.model, undefined);
-  assert.equal(result.fallbackProvider, undefined);
-  assert.equal(result.fallbackModel, undefined);
 });
 
 test("primary model without a provider field → handled (sort key empty string)", () => {
@@ -147,5 +133,4 @@ test("primary model without a provider field → handled (sort key empty string)
   const result = autoDetectDefaults([vision("", "lonely")]);
   assert.equal(result.provider, "");
   assert.equal(result.model, "lonely");
-  assert.equal(result.fallbackProvider, undefined);
 });

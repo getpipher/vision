@@ -299,11 +299,11 @@ Cloud primary + frontier escalation":
 - **Primary:** prefers the `Ollama` provider's vision-capable models (the
   `:cloud` ones — Ollama Cloud, flat-rate + private). On RECTOR's setup this
   picks `Ollama/minimax-m3:cloud` (first by sorted id).
-- **Fallback (frontier escalation):** the first vision-capable model under a
-  *different* provider (e.g. an OpenRouter GPT-4o), if one is configured. This
-  is the "escalate to the proper frontier model for that job" path — the
-  existing fallback mechanism, auto-populated.
-- The auto-detected values are **persisted once** to `vision.json` (you see
+- **Fallback:** NOT auto-populated (v0.5.1). The frontier-escalation mechanism
+  (the `fallback` field + the retry→fallback pipeline) is still there — set it
+  explicitly via `/vision fallback <provider/model>` if you want a secondary
+  vision model tried when the primary fails.
+- The auto-detected primary is **persisted once** to `vision.json` (you see
   the choice + can override it). `/vision clear` resets to defaults and
   re-triggers detection on the next session start.
 - Escape hatch: `/vision auto-detect off` (set `autoDetectVisionModel: false`)

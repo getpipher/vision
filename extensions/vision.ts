@@ -20,7 +20,7 @@
  */
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -33,6 +33,7 @@ import {
   type SettingItem,
   SelectItem,
   SelectList,
+  Spacer,
   Text,
 } from "@earendil-works/pi-tui";
 import { isMultimodal, syncToolAvailability, TOOL_NAME } from "../lib/capability.ts";
@@ -211,8 +212,27 @@ async function pickVisionModel(ctx: ExtensionContext): Promise<boolean> {
     );
     return false;
   }
-  const options = models.map((m) => `${m.provider}/${m.id}`);
-  const choice = await ctx.ui.select("Pick a vision model:", options);
+  const items = models.map((m) => ({ value: `${m.provider}/${m.id}`, label: `${m.provider}/${m.id}` }));
+  let choice: string | undefined;
+  if (ctx.mode === "tui") {
+    // v0.5.1: search-enabled picker in TUI mode (matches pi's /model UX).
+    choice = await ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+      const picker = new VisionModelPicker(
+        theme,
+        items,
+        (value) => done(value),
+        () => done(undefined),
+      );
+      return {
+        render(width: number) { return picker.render(width); },
+        invalidate() { picker.invalidate(); tui.requestRender(); },
+        handleInput(data: string) { picker.handleInput(data); tui.requestRender(); },
+      } as Component & { dispose?(): void };
+    });
+  } else {
+    // Non-TUI (RPC/print): fall back to the simple select dialog (no search).
+    choice = await ctx.ui.select("Pick a vision model:", items.map((i) => i.label));
+  }
   if (!choice) return false;
   const slash = choice.indexOf("/");
   if (slash <= 0 || slash >= choice.length - 1) return false;
@@ -232,6 +252,10 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
   }
   await ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
     const container = new Container();
+    // Blue border lines above + below the panel (matches pi's /settings visual framing).
+    const accentBorder = (text: string) => theme.fg("accent", text);
+    container.addChild(new DynamicBorder(accentBorder));
+    container.addChild(new Spacer(1));
     container.addChild(new Text(theme.fg("accent", theme.bold("Vision tool settings")), 0, 0));
 
     const items: SettingItem[] = [
@@ -415,6 +439,8 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
 
     container.addChild(settingsList);
     container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter edit/cycle • esc done"), 0, 0));
+    container.addChild(new Spacer(1));
+    container.addChild(new DynamicBorder(accentBorder));
 
     return {
       render(width: number) {
@@ -431,6 +457,80 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
   });
 }
 
+/**
+ * A search-enabled vision-model picker (v0.5.1: RECTOR feedback — match pi's
+ * /model + /settings UX). A Container with blue DynamicBorder lines above +
+ * below, a title, a search Input, + a SelectList that filters as you type.
+ *
+ * Input routing: Escape → cancel; Up/Down/Enter → the SelectList (navigation
+ * + selection); everything else → the search Input, which drives
+ * `selectList.setFilter(input.getValue())` for fuzzy matching. Used by both
+ * the `/vision` panel's "Vision model" submenu (buildModelSubmenu) + the
+ * `/vision model` no-arg quick-pick (pickVisionModel, TUI mode).
+ */
+class VisionModelPicker extends Container {
+  private readonly input: Input;
+  private readonly selectList: SelectList;
+  private readonly accentBorder: (text: string) => string;
+
+  constructor(
+    theme: Theme,
+    items: SelectItem[],
+    onSelect: (value: string) => void,
+    onCancel: () => void,
+  ) {
+    super();
+    this.accentBorder = (text: string) => theme.fg("accent", text);
+    this.addChild(new DynamicBorder(this.accentBorder));
+    this.addChild(new Spacer(1));
+    this.addChild(new Text(theme.bold(theme.fg("accent", "Pick a vision model")), 0, 0));
+    this.addChild(new Spacer(1));
+    this.addChild(new Text(theme.fg("muted", "Type to search • ↑↓ navigate • enter select • esc cancel"), 0, 0));
+    this.addChild(new Spacer(1));
+
+    this.input = new Input();
+    this.input.onSubmit = () => {
+      const item = this.selectList.getSelectedItem();
+      if (item) onSelect(item.value);
+    };
+    this.input.onEscape = () => onCancel();
+    this.addChild(this.input);
+    this.addChild(new Spacer(1));
+
+    this.selectList = new SelectList(items, 10, {
+      selectedPrefix: (text) => theme.fg("accent", text),
+      selectedText: (text) => theme.fg("accent", text),
+      description: (text) => theme.fg("muted", text),
+      scrollInfo: (text) => theme.fg("dim", text),
+      noMatch: (text) => theme.fg("warning", text),
+    });
+    this.selectList.onSelect = (item) => onSelect(item.value || "");
+    this.selectList.onCancel = () => onCancel();
+    this.addChild(this.selectList);
+    this.addChild(new Spacer(1));
+    this.addChild(new DynamicBorder(this.accentBorder));
+  }
+
+  handleInput(data: string): void {
+    // Navigation + selection → the SelectList.
+    if (matchesKey(data, "up") || matchesKey(data, "down") || matchesKey(data, "enter") || matchesKey(data, "return")) {
+      this.selectList.handleInput(data);
+      this.invalidate();
+      return;
+    }
+    // Escape → cancel (let the Input's onEscape handle it, but also guard here).
+    if (matchesKey(data, "escape") || matchesKey(data, "esc")) {
+      this.selectList.onCancel?.();
+      this.invalidate();
+      return;
+    }
+    // Everything else → the search Input, then re-filter the list.
+    this.input.handleInput(data);
+    this.selectList.setFilter(this.input.getValue());
+    this.invalidate();
+  }
+}
+
 /** Build the vision-model sub-picker shown when Enter is pressed on the model
  *  row of the settings panel. A SelectList over vision-capable authed models. */
 function buildModelSubmenu(
@@ -443,16 +543,13 @@ function buildModelSubmenu(
     models.length > 0
       ? models.map((m) => ({ value: `${m.provider}/${m.id}`, label: `${m.provider}/${m.id}` }))
       : [{ value: "", label: "(no vision-capable models — add one to models.json)" }];
-  const sl = new SelectList(items, 10, {
-    selectedPrefix: (text) => theme.fg("accent", text),
-    selectedText: (text) => theme.fg("accent", text),
-    description: (text) => theme.fg("muted", text),
-    scrollInfo: (text) => theme.fg("dim", text),
-    noMatch: (text) => theme.fg("warning", text),
-  });
-  sl.onSelect = (item) => subDone(item.value || undefined);
-  sl.onCancel = () => subDone();
-  return sl;
+  // v0.5.1: search-enabled picker (matches pi's /model + /settings UX).
+  return new VisionModelPicker(
+    theme,
+    items,
+    (value) => subDone(value || undefined),
+    () => subDone(),
+  );
 }
 
 /** Build the single-line system-prompt editor shown when Enter is pressed on
@@ -536,21 +633,18 @@ export default function visionExtension(pi: ExtensionAPI): void {
     if (config.autoDetectVisionModel && !config.provider && !config.model && typeof ctx.modelRegistry?.getAvailable === "function") {
       const detected = autoDetectDefaults(ctx.modelRegistry.getAvailable());
       if (detected.provider && detected.model) {
+        // v0.5.1: auto-detect sets ONLY the primary. The fallback is NOT
+        // auto-populated — the user sets it explicitly via /vision fallback
+        // if they want frontier escalation. (RECTOR feedback: a default
+        // fallback was too opinionated.)
         config = {
           ...config,
           provider: detected.provider,
           model: detected.model,
-          // Only set the fallback if the user hadn't set one (don't override
-          // an explicit unset-ness the user may want — SPEC-5 §9.5).
-          ...(config.fallbackProvider || config.fallbackModel
-            ? {}
-            : { fallbackProvider: detected.fallbackProvider, fallbackModel: detected.fallbackModel }),
         };
         saveConfig(config, getAgentDir());
         ctx.ui.notify(
-          `Vision: auto-configured ${detected.provider}/${detected.model}` +
-            (detected.fallbackModel ? ` (+ fallback ${detected.fallbackProvider}/${detected.fallbackModel})` : "") +
-            `. /vision to change.`,
+          `Vision: auto-configured ${detected.provider}/${detected.model}. /vision to change.`,
           "info",
         );
       }
