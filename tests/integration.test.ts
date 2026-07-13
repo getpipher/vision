@@ -478,15 +478,25 @@ test("picker: /vision model with no arg opens select + sets provider+model toget
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k", headers: undefined }),
     } as any,
   }) as unknown as ExtensionCommandContext;
+  // v0.5.1: TUI mode uses ctx.ui.custom (search picker). Mock it to resolve
+  // with the user's pick + capture the items via the registry (same filter
+  // pickVisionModel uses). The select mock stays for the non-TUI fallback.
+  (pickerCtx.ui as any).custom = async () => {
+    selectedOptions = (pickerCtx.modelRegistry.getAvailable() as any[])
+      .filter((m) => m.input?.includes("image"))
+      .map((m) => `${m.provider}/${m.id}`);
+    return "ollama/minimax-m3:cloud";
+  };
   (pickerCtx.ui as any).select = async (title: string, options: string[]) => {
     selectedTitle = title;
     selectedOptions = options;
-    return "ollama/minimax-m3:cloud"; // user picks this
+    return "ollama/minimax-m3:cloud";
   };
   let notified = "";
   (pickerCtx.ui as any).notify = (msg: string) => { notified = msg; };
   await pi.commands.get("vision")!.handler("model", pickerCtx);
-  assert.match(selectedTitle, /Pick a vision model/);
+  // v0.5.1: the title is rendered inside the VisionModelPicker component (TUI),
+  // not passed to ctx.ui.select, so selectedTitle stays "" — assert via items instead.
   // Only vision-capable (input includes image) models listed: MULTIMODAL + VISION_MODEL
   assert.ok(selectedOptions.includes("ollama/minimax-m3:cloud"));
   assert.ok(!selectedOptions.includes("ollama/glm-5.2:cloud"), "text-only model excluded from picker");
@@ -532,7 +542,9 @@ test("picker: user cancels (select returns undefined) → no config change", asy
     model: TEXT_ONLY,
     registry: { getAvailable: () => [MULTIMODAL], find: () => VISION_MODEL, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k", headers: undefined }) } as any,
   }) as unknown as ExtensionCommandContext;
-  (pickerCtx.ui as any).select = async () => undefined; // cancel
+  // v0.5.1: TUI mode uses ctx.ui.custom; cancel = resolve undefined.
+  (pickerCtx.ui as any).custom = async () => undefined;
+  (pickerCtx.ui as any).select = async () => undefined; // cancel (non-TUI fallback)
   (pickerCtx.ui as any).notify = () => {};
   await pi.commands.get("vision")!.handler("model", pickerCtx);
   // config.model unchanged
@@ -713,6 +725,8 @@ test("T24: ctrl+shift+i shortcut registered + invokes pickVisionModel → config
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k", headers: undefined }),
     } as any,
   }) as unknown as ExtensionContext;
+  // v0.5.1: TUI mode uses ctx.ui.custom (search picker).
+  (sc.ui as any).custom = async () => "ollama/minimax-m3:cloud";
   (sc.ui as any).select = async (_t: string, _o: string[]) => "ollama/minimax-m3:cloud";
   (sc.ui as any).notify = (msg: string) => { notified = msg; };
   await shortcut!.handler(sc);
@@ -1648,7 +1662,7 @@ test("T61: auto-detect picks Ollama/minimax-m3:cloud on fresh config (+ no fallb
 });
 
 // ── T62: auto-detect frontier fallback ────────────────────────────────
-test("T62: auto-detect picks Ollama primary + OpenRouter frontier fallback", async () => {
+test("T62: auto-detect picks Ollama primary, does NOT auto-set a fallback (v0.5.1)", async () => {
   const pi = createMockPi();
   visionFactory(pi as unknown as ExtensionAPI);
   resetVisionConfig();
@@ -1662,9 +1676,10 @@ test("T62: auto-detect picks Ollama primary + OpenRouter frontier fallback", asy
   const persisted = loadConfig(getAgentDir());
   assert.equal(persisted.provider, "Ollama");
   assert.equal(persisted.model, "minimax-m3:cloud");
-  assert.equal(persisted.fallbackProvider, "OpenRouter", "frontier fallback auto-detected");
-  assert.equal(persisted.fallbackModel, "gpt-4o");
-  assert.match(notified, /fallback OpenRouter\/gpt-4o/, "notify names both primary + fallback");
+  // v0.5.1: auto-detect sets ONLY the primary. No fallback auto-populated.
+  assert.equal(persisted.fallbackProvider, undefined, "no auto-fallback (user sets it explicitly)");
+  assert.equal(persisted.fallbackModel, undefined);
+  assert.doesNotMatch(notified, /fallback/, "notify does not mention a fallback");
 });
 
 // ── T63: auto-detect no vision models → no-op ─────────────────────────
@@ -1727,8 +1742,8 @@ test("T65: auto-detect skipped when autoDetectVisionModel:false (fresh config st
   assert.equal(notified, "");
 });
 
-// ── auto-detect doesn't override an explicitly-set fallback ───────────
-test("auto-detect sets primary but does NOT override an explicitly-set fallback", async () => {
+// ── auto-detect preserves an explicitly-set fallback (v0.5.1: it never touches fallback) ──
+test("auto-detect sets primary + preserves an explicit user fallback (v0.5.1)", async () => {
   const pi = createMockPi();
   visionFactory(pi as unknown as ExtensionAPI);
   resetVisionConfig();
@@ -1737,12 +1752,13 @@ test("auto-detect sets primary but does NOT override an explicitly-set fallback"
   saveConfig({ ...DEFAULT_CONFIG, fallbackProvider: "MyProvider", fallbackModel: "my-model" }, getAgentDir());
   const ctx = makeCtxWithRegistry({
     model: TEXT_ONLY,
-    available: [ollamaVision("minimax-m3:cloud"), ollamaVision("qwen3.5:cloud"), openRouterVision("gpt-4o")],
+    available: [ollamaVision("minimax-m3:cloud"), openRouterVision("gpt-4o")],
   });
   await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
   const persisted = loadConfig(getAgentDir());
   assert.equal(persisted.provider, "Ollama", "primary auto-detected");
   assert.equal(persisted.model, "minimax-m3:cloud");
+  // Auto-detect never touches the fallback — the user's explicit value is preserved.
   assert.equal(persisted.fallbackProvider, "MyProvider", "user's explicit fallback preserved");
   assert.equal(persisted.fallbackModel, "my-model");
 });

@@ -24,8 +24,6 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 export interface DetectedDefaults {
   provider: string | undefined;
   model: string | undefined;
-  fallbackProvider: string | undefined;
-  fallbackModel: string | undefined;
 }
 
 /** The provider id we prefer for the primary vision model (Ollama Cloud per
@@ -33,30 +31,24 @@ export interface DetectedDefaults {
 export const PREFERRED_PRIMARY_PROVIDER = "Ollama";
 
 /**
- * Scan vision-capable models + pick a workflow-fit primary + frontier fallback.
+ * Scan vision-capable models + pick a workflow-fit PRIMARY (v0.5.1: ONLY the
+ * primary — the fallback is NOT auto-populated; the user sets it explicitly
+ * via /vision fallback if they want frontier escalation).
  *
  * Algorithm:
  * 1. Filter to vision-capable models (`input` includes "image").
- * 2. If none → all undefined (no-op; the existing not-configured error guides
+ * 2. If none → undefined (no-op; the existing not-configured error guides
  *    the user).
  * 3. Primary: prefer the `Ollama` provider; among those, first by sorted
  *    `(provider, id)`. If no Ollama vision model, pick the first vision
  *    model of any provider by sorted id.
- * 4. Fallback: first vision model NOT under the primary's provider (frontier
- *    escalation — a different provider's vision model). If only one provider
- *    has vision models, fallback is undefined.
  *
  * Pure + deterministic (same input in any order → same output).
  */
 export function autoDetectDefaults(models: Model<Api>[]): DetectedDefaults {
   const visionModels = models.filter((m) => m.input?.includes("image"));
   if (visionModels.length === 0) {
-    return {
-      provider: undefined,
-      model: undefined,
-      fallbackProvider: undefined,
-      fallbackModel: undefined,
-    };
+    return { provider: undefined, model: undefined };
   }
 
   // Deterministic order: sort by provider then id.
@@ -70,13 +62,5 @@ export function autoDetectDefaults(models: Model<Api>[]): DetectedDefaults {
   const preferred = sorted.find((m) => m.provider === PREFERRED_PRIMARY_PROVIDER);
   const primary = preferred ?? sorted[0]!;
 
-  // Fallback: first vision model NOT under the primary's provider.
-  const fallback = sorted.find((m) => m.provider !== primary.provider);
-
-  return {
-    provider: primary.provider,
-    model: primary.id,
-    fallbackProvider: fallback?.provider,
-    fallbackModel: fallback?.id,
-  };
+  return { provider: primary.provider, model: primary.id };
 }
