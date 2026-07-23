@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write  # needed to create GitHub Releases on tag push
 
 jobs:
   publish:
@@ -58,3 +58,18 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
+
+      # Keep GitHub Releases in sync with npm: create a release for the tag
+      # (auto-generated notes). Idempotent — skips if the release already exists.
+      # Uses the auto-provided github.token (no third-party action).
+      - name: Create GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::Release $tag already exists — skipping"
+          else
+            gh release create "$tag" --generate-notes --title "$tag"
+          fi
