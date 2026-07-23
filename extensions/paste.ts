@@ -1,5 +1,5 @@
 /**
- * @getpither/vision — paste extension (SPEC-3: graduated from B-lite).
+ * @getpipher/vision — paste extension (SPEC-3: graduated from B-lite).
  *
  * Input event hook that makes pasted/referenced images visible + actionable
  * end-to-end, capability-aware for both multimodal AND text-only primaries.
