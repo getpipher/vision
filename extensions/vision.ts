@@ -82,6 +82,7 @@ const SUBCOMMANDS = [
   "max-dim",
   "quality",
   "reasoning-effort",
+  "temperature",
   "system-prompt",
   "cache",
   "fallback",
@@ -105,6 +106,7 @@ function formatConfigStatus(c: VisionConfig): string {
     `  maxDimension:    ${c.maxDimension}px`,
     `  jpegQuality:     ${c.jpegQuality}`,
     `  reasoning:       ${c.defaultReasoningEffort}`,
+    `  temperature:     ${c.defaultTemperature}`,
     `  systemPrompt:    ${c.systemPrompt ? truncatePreview(c.systemPrompt, 40) : "(none)"}`,
     `  cache:           ${c.cacheEnabled ? "on" : "off"}${c.cachePersist ? " (persisted, max " + c.cacheMaxEntries + ")" : ""}`,
     `  retry:           ${c.retryAttempts} attempts, ${c.retryBackoffMs}ms backoff`,
@@ -141,6 +143,8 @@ function renderValue(id: string): string {
       return `${config.jpegQuality}`;
     case "reasoning":
       return config.defaultReasoningEffort;
+    case "temperature":
+      return `${config.defaultTemperature}`;
     case "systemPrompt":
       return config.systemPrompt ? truncatePreview(config.systemPrompt, 40) : "(none)";
     case "cacheEnabled":
@@ -293,6 +297,13 @@ async function showVisionSettings(pi: ExtensionAPI, ctx: ExtensionCommandContext
         currentValue: renderValue("reasoning"),
         values: [...REASONING_LEVELS],
         description: "Default reasoning effort for delegation calls.",
+      },
+      {
+        id: "temperature",
+        label: "Temperature",
+        currentValue: renderValue("temperature"),
+        values: ["0", "0.5", "1"],
+        description: "Model temperature (0–2). Some providers require specific values (e.g. Kimi Code requires 1).",
       },
       // ── v0.2.0 (SPEC-2) rows ────────────────────────────────────────────
       {
@@ -889,6 +900,22 @@ export default function visionExtension(pi: ExtensionAPI): void {
           config = { ...config, defaultReasoningEffort: raw as ReasoningLevel };
           saveConfig(config, agentDir);
           ctx.ui.notify(`Default reasoning effort set to ${raw}.`, "info");
+          return;
+        }
+        case "temperature": {
+          const raw = parts[1];
+          if (!raw) {
+            ctx.ui.notify(`Current temperature: ${config.defaultTemperature}`, "info");
+            return;
+          }
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n < 0 || n > 2) {
+            ctx.ui.notify("Usage: /vision temperature <0-2> (e.g. 0, 0.5, 1)", "warning");
+            return;
+          }
+          config = { ...config, defaultTemperature: n };
+          saveConfig(config, agentDir);
+          ctx.ui.notify(`Temperature set to ${config.defaultTemperature}.`, "info");
           return;
         }
         case "clear": {

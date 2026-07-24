@@ -51,6 +51,9 @@ export interface VisionConfig {
   jpegQuality: number;
   /** Default reasoning effort for delegation calls (overridable per call). */
   defaultReasoningEffort: ReasoningLevel;
+  /** Default temperature for delegation calls (0–2). Some providers (e.g. Kimi Code)
+   *  only accept specific values (e.g. 1). */
+  defaultTemperature: number;
   /** Master switch. When false, describe_image is hidden + errors if invoked. */
   enabled: boolean;
   // ── v0.2.0 (SPEC-2) ──────────────────────────────────────────────────────
@@ -118,6 +121,7 @@ export const DEFAULT_CONFIG: VisionConfig = {
   maxDimension: 1568,
   jpegQuality: 85,
   defaultReasoningEffort: "off",
+  defaultTemperature: 0,
   enabled: true,
   // v0.2.0 defaults
   systemPrompt: undefined,
@@ -189,6 +193,9 @@ export function mergeConfig(partial: unknown): VisionConfig {
     defaultReasoningEffort: isReasoningLevel(p.defaultReasoningEffort)
       ? p.defaultReasoningEffort
       : DEFAULT_CONFIG.defaultReasoningEffort,
+    defaultTemperature: typeof p.defaultTemperature === "number"
+      ? Math.min(2, Math.max(0, p.defaultTemperature))
+      : DEFAULT_CONFIG.defaultTemperature,
     enabled: typeof p.enabled === "boolean" ? p.enabled : DEFAULT_CONFIG.enabled,
     // v0.2.0 fields
     systemPrompt: strOrUndef(p.systemPrompt),
@@ -282,6 +289,11 @@ export function applySettingChange(
     case "reasoning":
       if (isReasoningLevel(value)) return { ...config, defaultReasoningEffort: value };
       return config;
+    case "temperature": {
+      const n = parseFloat(value);
+      if (!Number.isFinite(n)) return config;
+      return { ...config, defaultTemperature: Math.min(2, Math.max(0, n)) };
+    }
     // ── v0.2.0 fields ──────────────────────────────────────────────────────
     case "systemPrompt":
       // Empty string (panel Input cleared) → undefined; otherwise the typed text.
