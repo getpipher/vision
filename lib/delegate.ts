@@ -31,6 +31,8 @@ export interface DelegateParams {
   prompt: string;
   compress: boolean;
   reasoning: ReasoningLevel;
+  /** Temperature for the vision model call (0–2). Defaults to config.defaultTemperature. */
+  temperature?: number;
 }
 
 export interface DelegateSuccess {
@@ -83,6 +85,7 @@ export async function callVisionModel(
   signal: AbortSignal | undefined,
   reasoning: ReasoningLevel,
   systemPrompt?: string,
+  temperature?: number,
 ): Promise<string> {
   const baseUrl = visionModel.baseUrl.replace(/\/+$/, "");
   const messages: unknown[] = [];
@@ -103,7 +106,7 @@ export async function callVisionModel(
     model: visionModel.id,
     messages,
     max_tokens: 4096,
-    temperature: 0,
+    temperature: temperature ?? 0,
   };
   const reasoningParams = buildReasoningParams(visionModel, reasoning);
   if (reasoningParams) Object.assign(body, reasoningParams);
@@ -382,7 +385,7 @@ async function callWithRetryAndFallback(
 ): Promise<DelegateResult> {
   try {
     const text = await withRetry(
-      () => callVisionModel(primaryModel, apiKey, headers, image, params.prompt, signal, params.reasoning, config.systemPrompt),
+      () => callVisionModel(primaryModel, apiKey, headers, image, params.prompt, signal, params.reasoning, config.systemPrompt, config.defaultTemperature),
       { attempts: config.retryAttempts, backoffMs: config.retryBackoffMs, signal },
     );
     return { ok: true, text, details: { ...baseDetails, cached: false, fallback: false } };
@@ -431,7 +434,7 @@ async function runFallback(
     };
   }
   try {
-    const text = await callVisionModel(fbModel, fbAuth.apiKey, fbAuth.headers, image, params.prompt, signal, params.reasoning, config.systemPrompt);
+    const text = await callVisionModel(fbModel, fbAuth.apiKey, fbAuth.headers, image, params.prompt, signal, params.reasoning, config.systemPrompt, config.defaultTemperature);
     return {
       ok: true,
       text,
