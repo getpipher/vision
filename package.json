@@ -21,6 +21,12 @@
     "url": "https://github.com/getpipher/vision/issues"
   },
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.ts"
+    }
+  },
   "engines": {
     "node": ">=20"
   },
@@ -33,6 +39,7 @@
   "files": [
     "extensions",
     "lib",
+    "src",
     "README.md",
     "LICENSE"
   ],
