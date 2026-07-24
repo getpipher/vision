@@ -19,12 +19,12 @@
  */
 import type { Model, Api } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isConfiguredForDelegation, type ReasoningLevel, type VisionConfig } from "./config.ts";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { isConfiguredForDelegation, loadConfig, type ReasoningLevel, type VisionConfig } from "./config.ts";
 import { loadImage, type LoadedImage } from "./image.ts";
 import { cacheKey, type VisionCache } from "./cache.ts";
 import { AbortError, classifyError, withRetry } from "./resilience.ts";
 import { appendAuditEntry, resolveAuditPath, truncateImagePathForLog, type AuditEntry } from "./audit.ts";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface DelegateParams {
   image_path: string;
@@ -455,4 +455,38 @@ async function runFallback(
       details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
     };
   }
+}
+// ── ModelRegistry-backed delegator (SPEC-2: for non-extension consumers like armory-fleet).
+// Takes a ModelRegistry (the { find, getApiKeyAndHeaders } slice delegateToVisionModel reads)
+// so consumers with a ModelRuntime construct `new ModelRegistry(modelRuntime)` themselves
+// (ModelRegistry is exported by @earendil-works/pi-coding-agent) and pass it here.
+// This keeps vision free of ModelRuntime coupling and is unit-testable with a trivial fake.
+
+export interface ModelRegistryLike {
+  find(provider: string, modelId: string): Model<Api> | undefined;
+  getApiKeyAndHeaders(model: Model<Api>): Promise<unknown>;
+}
+
+export interface VisionDelegatorDeps {
+  /** A ModelRegistry (or the minimal { find, getApiKeyAndHeaders } slice). */
+  modelRegistry: ModelRegistryLike;
+  /** The cwd for image path resolution. */
+  cwd: string;
+  /** The pi agent dir (where vision.json lives). */
+  agentDir: string;
+}
+
+export interface VisionDelegator {
+  delegate(params: DelegateParams, signal?: AbortSignal | undefined): Promise<DelegateResult>;
+  config: VisionConfig;
+}
+
+export function createVisionDelegator(deps: VisionDelegatorDeps): VisionDelegator {
+  const config = loadConfig(deps.agentDir);
+  // delegateToVisionModel reads only ctx.modelRegistry + ctx.cwd; construct a minimal ctx.
+  const ctx = { modelRegistry: deps.modelRegistry, cwd: deps.cwd } as unknown as ExtensionContext;
+  return {
+    config,
+    delegate: (params, signal) => delegateToVisionModel(ctx, config, params, signal),
+  };
 }
