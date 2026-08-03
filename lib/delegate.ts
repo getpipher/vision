@@ -59,13 +59,68 @@ export interface DelegateFailure {
 
 export type DelegateResult = DelegateSuccess | DelegateFailure;
 
-/** Build provider-specific reasoning params for the request body, if any. */
+/** Build provider-specific reasoning params for the request body, if any.
+ *  OpenAI-compatible APIs only — Anthropic Messages has no
+ *  `reasoning_effort` field (see `buildAnthropicBody`). */
 function buildReasoningParams(
   visionModel: Model<Api>,
   level: ReasoningLevel,
 ): Record<string, unknown> | undefined {
   if (!visionModel.reasoning || level === "off") return undefined;
   return { reasoning_effort: level };
+}
+
+/** True when the model speaks Anthropic Messages (POST {baseUrl}/v1/messages).
+ *  Models registered with `api: "anthropic-messages"` (MiniMax, Claude,
+ *  Qwen via Anthropic-compat endpoints) would 404 if we blindly used the
+ *  OpenAI `/chat/completions` route. */
+function isAnthropicMessagesApi(visionModel: Model<Api>): boolean {
+  return visionModel.api === "anthropic-messages";
+}
+
+/** Anthropic Messages request body: images as `source.base64` blocks, the
+ *  system prompt as a top-level `system` field (NOT a messages entry), and
+ *  no `temperature`/`reasoning_effort` (not part of the Messages schema). */
+function buildAnthropicBody(
+  visionModel: Model<Api>,
+  image: LoadedImage,
+  prompt: string,
+  systemPrompt: string | undefined,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: visionModel.id,
+    max_tokens: 4096,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: image.mimeType,
+              data: image.data,
+            },
+          },
+          { type: "text", text: prompt },
+        ],
+      },
+    ],
+  };
+  if (systemPrompt && systemPrompt.length > 0) body.system = systemPrompt;
+  return body;
+}
+
+/** Extract the assistant text from an Anthropic Messages response: the first
+ *  `content` block of type `text`; if the model returned only a `thinking`
+ *  block (reasoning models), fall back to its `thinking` text. */
+function extractAnthropicText(json: unknown): string | undefined {
+  const blocks = (json as { content?: Array<{ type?: string; text?: string; thinking?: string }> })?.content;
+  if (!Array.isArray(blocks)) return undefined;
+  const textBlock = blocks.find((b) => b.type === "text" && typeof b.text === "string" && b.text.length > 0);
+  if (textBlock?.text) return textBlock.text;
+  const thinkingBlock = blocks.find((b) => b.type === "thinking" && typeof b.thinking === "string" && b.thinking.length > 0);
+  return thinkingBlock?.thinking;
 }
 
 /**
@@ -85,6 +140,57 @@ export async function callVisionModel(
   systemPrompt?: string,
 ): Promise<string> {
   const baseUrl = visionModel.baseUrl.replace(/\/+$/, "");
+  const anthropic = isAnthropicMessagesApi(visionModel);
+
+  // API-aware routing: Anthropic Messages models POST to {baseUrl}/v1/messages
+  // with the Messages schema; everything else keeps the OpenAI-compatible
+  // /chat/completions shape. Previously every model was forced onto the
+  // OpenAI route, so `api: "anthropic-messages"` models (e.g. MiniMax M3 at
+  // api.minimaxi.com/anthropic) got a hard 404 from a nonexistent
+  // `/chat/completions` route.
+  const url = anthropic ? `${baseUrl}/v1/messages` : `${baseUrl}/chat/completions`;
+  const body: Record<string, unknown> = anthropic
+    ? buildAnthropicBody(visionModel, image, prompt, systemPrompt)
+    : buildOpenAIBody(visionModel, image, prompt, systemPrompt, reasoning);
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  if (providerHeaders) Object.assign(headers, providerHeaders);
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => "");
+    throw new Error(
+      `Vision model returned ${response.status}: ${errBody.slice(0, 500)}`,
+    );
+  }
+
+  const json = await response.json();
+  const text = anthropic
+    ? extractAnthropicText(json)
+    : extractOpenAIText(json);
+  if (!text) {
+    throw new Error("Vision model returned no content in the response");
+  }
+  return text;
+}
+
+/** OpenAI-compatible request body (the historical behavior of this tool):
+ *  images as `image_url` data URLs, system prompt as a leading system
+ *  message, optional `reasoning_effort` for reasoning models. */
+function buildOpenAIBody(
+  visionModel: Model<Api>,
+  image: LoadedImage,
+  prompt: string,
+  systemPrompt: string | undefined,
+  reasoning: ReasoningLevel,
+): Record<string, unknown> {
   const messages: unknown[] = [];
   if (systemPrompt && systemPrompt.length > 0) {
     messages.push({ role: "system", content: systemPrompt });
@@ -107,34 +213,14 @@ export async function callVisionModel(
   };
   const reasoningParams = buildReasoningParams(visionModel, reasoning);
   if (reasoningParams) Object.assign(body, reasoningParams);
+  return body;
+}
 
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  if (providerHeaders) Object.assign(headers, providerHeaders);
-
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => "");
-    throw new Error(
-      `Vision model returned ${response.status}: ${errBody.slice(0, 500)}`,
-    );
-  }
-
-  const json = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
-  };
-  const msg = json.choices?.[0]?.message;
-  const text = msg?.content || msg?.reasoning_content;
-  if (!text) {
-    throw new Error("Vision model returned no content in the response");
-  }
-  return text;
+/** Extract the assistant text from an OpenAI-compatible response. */
+function extractOpenAIText(json: unknown): string | undefined {
+  const choices = (json as { choices?: Array<{ message?: { content?: string; reasoning_content?: string } }> })?.choices;
+  const msg = choices?.[0]?.message;
+  return msg?.content || msg?.reasoning_content;
 }
 
 function formatImageError(error: { code: string; path?: string; message?: string }, inputPath: string): string {
