@@ -143,6 +143,157 @@ test("callVisionModel: sends chat/completions POST with image data URL + prompt"
   }
 });
 
+// ── v0.6.0: API-shape-aware routing (anthropic-messages) ────────────────
+
+test("callVisionModel: anthropic-messages api → POST {baseUrl}/v1/messages with Anthropic body", async () => {
+  const m = mockFetch({
+    status: 200,
+    body: { content: [{ type: "text", text: "a red square" }] },
+  });
+  try {
+    const text = await callVisionModel(
+      makeVisionModel({ api: "anthropic-messages" as Api, baseUrl: "https://api.example.com/anthropic" }),
+      "key-123",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "describe this",
+      undefined,
+      "off",
+    );
+    assert.equal(text, "a red square");
+    assert.equal(m.calls.length, 1);
+    assert.equal(m.calls[0]!.url, "https://api.example.com/anthropic/v1/messages");
+    const init = m.calls[0]!.init;
+    assert.equal(init.method, "POST");
+    const headers = init.headers as Record<string, string>;
+    assert.equal(headers.Authorization, "Bearer key-123");
+    assert.equal(headers["Content-Type"], "application/json");
+    const body = JSON.parse(init.body as string);
+    assert.equal(body.model, "minimax-m3:cloud");
+    assert.equal(body.max_tokens, 4096);
+    assert.ok(!("temperature" in body), "Anthropic Messages has no temperature field");
+    assert.equal(body.messages.length, 1);
+    assert.equal(body.messages[0].role, "user");
+    const content = body.messages[0].content;
+    assert.equal(content[0].type, "image");
+    assert.equal(content[0].source.type, "base64");
+    assert.equal(content[0].source.media_type, "image/png");
+    assert.equal(content[0].source.data, PNG_1x1_B64);
+    assert.equal(content[1].type, "text");
+    assert.equal(content[1].text, "describe this");
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: anthropic-messages api → system prompt goes to top-level system field", async () => {
+  const m = mockFetch({ status: 200, body: { content: [{ type: "text", text: "ok" }] } });
+  try {
+    await callVisionModel(
+      makeVisionModel({ api: "anthropic-messages" as Api, baseUrl: "https://api.example.com/anthropic" }),
+      "k",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "p",
+      undefined,
+      "off",
+      "You are a forensic analyst.",
+    );
+    const body = JSON.parse(m.calls[0]!.init.body as string);
+    assert.equal(body.system, "You are a forensic analyst.");
+    assert.equal(body.messages.length, 1, "system is top-level, not a messages entry");
+    assert.equal(body.messages[0].role, "user");
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: anthropic-messages api → parses text block from content array", async () => {
+  const m = mockFetch({
+    status: 200,
+    body: {
+      content: [
+        { type: "thinking", thinking: "it has four sides" },
+        { type: "text", text: "a red square" },
+      ],
+    },
+  });
+  try {
+    const text = await callVisionModel(
+      makeVisionModel({ api: "anthropic-messages" as Api, baseUrl: "https://api.example.com/anthropic" }),
+      "k",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "what shape",
+      undefined,
+      "off",
+    );
+    assert.equal(text, "a red square", "text block wins over thinking block");
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: anthropic-messages api → falls back to thinking block when no text block", async () => {
+  const m = mockFetch({
+    status: 200,
+    body: { content: [{ type: "thinking", thinking: "thought-only response" }] },
+  });
+  try {
+    const text = await callVisionModel(
+      makeVisionModel({ api: "anthropic-messages" as Api, baseUrl: "https://api.example.com/anthropic" }),
+      "k",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "p",
+      undefined,
+      "off",
+    );
+    assert.equal(text, "thought-only response");
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: anthropic-messages api → error path surfaces status + body excerpt", async () => {
+  const m = mockFetchError(404, "404 page not found");
+  try {
+    await assert.rejects(
+      callVisionModel(
+        makeVisionModel({ api: "anthropic-messages" as Api, baseUrl: "https://api.example.com/anthropic" }),
+        "k",
+        undefined,
+        { data: PNG_1x1_B64, mimeType: "image/png" },
+        "p",
+        undefined,
+        "off",
+      ),
+      /404: 404 page not found/,
+    );
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: anthropic-messages api → reasoning_effort NOT sent (Anthropic has no such field)", async () => {
+  const m = mockFetch({ status: 200, body: { content: [{ type: "text", text: "ok" }] } });
+  try {
+    await callVisionModel(
+      makeVisionModel({ api: "anthropic-messages" as Api, baseUrl: "https://api.example.com/anthropic", reasoning: true }),
+      "k",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "p",
+      undefined,
+      "high",
+    );
+    const body = JSON.parse(m.calls[0]!.init.body as string);
+    assert.equal(body.reasoning_effort, undefined);
+  } finally {
+    m.restore();
+  }
+});
+
 test("callVisionModel: falls back to reasoning_content when content is empty", async () => {
   const m = mockFetch({
     status: 200,
