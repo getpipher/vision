@@ -12,6 +12,7 @@
  * reason about the attached image / choose to call describe_image) still
  * needs a manual fresh-session check — see the session handoff.
  */
+import "./setup.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -25,17 +26,16 @@ import type {
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-
-// Redirect getAgentDir() to a temp dir so /vision commands never touch the
-// real ~/.pi/agent/vision.json during this test run.
-const TMP_AGENT = mkdtempSync(join(tmpdir(), "vision-eval-agent-"));
-process.env.PI_CODING_AGENT_DIR = TMP_AGENT;
-
 import visionFactory from "../extensions/vision.ts";
 import pasteFactory from "../extensions/paste.ts";
 import { loadConfig, configFilePath } from "../lib/config.ts";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { countAuditLog, tailAuditLog } from "../lib/audit.ts";
+
+// The redirect away from the real ~/.pi/agent is installed by ./setup.ts, which
+// also owns the temp dir's lifetime; this is just the dir the /vision commands
+// under test read and write.
+const TMP_AGENT = getAgentDir();
 
 const PNG_1x1_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M8AAAMBEg1+mP0AAAAASUVORK5CYII=";
@@ -1981,9 +1981,4 @@ test("T70: v0.5.0 regression gate — config fields + subcommands + auto-detect 
   assert.match(notified, /auto-configured/);
   // Full suite green = T70 passed (if this test runs, the suite compiled + loaded).
   assert.ok(true, "v0.5.0 surface wired + regression gate passed");
-});
-
-// Cleanup the temp agent dir after all tests.
-test("cleanup", () => {
-  rmSync(TMP_AGENT, { recursive: true, force: true });
 });
