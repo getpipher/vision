@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectMimeType, hashBytes, loadImage, MAX_IMAGE_BYTES } from "../lib/image.ts";
+import { detectMimeType, expandTilde, hashBytes, loadImage, MAX_IMAGE_BYTES } from "../lib/image.ts";
 
 // 1×1 transparent PNG — decodes to bytes starting with the PNG signature
 // (89 50 4E 47 0D 0A 1A 0A).
@@ -210,4 +210,44 @@ test("loadImage: data URL + raw base64 both return sourceHash", async () => {
 test("hashBytes: empty + known vector", () => {
   assert.equal(hashBytes(Buffer.alloc(0)), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
   assert.equal(hashBytes(PNG_BYTES).length, 64);
+});
+// ── Tilde expansion (fix: ~/ was stripped to "/", never hitting $HOME) ──────
+
+test("expandTilde: ~/ expands against the home directory", () => {
+  assert.equal(expandTilde("~/Desktop/x.png"), join(homedir(), "Desktop", "x.png"));
+});
+
+test("expandTilde: bare ~ expands to the home directory", () => {
+  assert.equal(expandTilde("~"), homedir());
+});
+
+test("expandTilde: ~user is NOT expanded (another user's home)", () => {
+  assert.equal(expandTilde("~alice/x.png"), "~alice/x.png");
+});
+
+test("expandTilde: non-tilde input passes through unchanged", () => {
+  assert.equal(expandTilde("/tmp/x.png"), "/tmp/x.png");
+  assert.equal(expandTilde("./x.png"), "./x.png");
+  assert.equal(expandTilde("../a/x.png"), "../a/x.png");
+});
+
+test("expandTilde: a tilde mid-path is not a home reference", () => {
+  assert.equal(expandTilde("/tmp/~/x.png"), "/tmp/~/x.png");
+});
+
+test("loadImage: ~/ path resolves against $HOME, not cwd", async () => {
+  const home = tmpDir();
+  const origHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    writeFileSync(join(home, "tilde.png"), PNG_BYTES);
+    // cwd deliberately points elsewhere: a correct expansion must ignore it.
+    const result = await loadImage("~/tilde.png", { ...LOAD_OPTS, cwd: join(home, "unrelated") });
+    assert.equal(result.ok, true, "~/tilde.png must resolve to $HOME/tilde.png");
+    if (result.ok) assert.equal(result.image.mimeType, "image/png");
+  } finally {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    rmSync(home, { recursive: true, force: true });
+  }
 });

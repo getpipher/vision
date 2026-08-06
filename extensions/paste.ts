@@ -26,11 +26,11 @@
  * session_start + every mutation).
  */
 import { existsSync, statSync } from "node:fs";
-import { isAbsolute, resolve as resolvePath } from "node:path";
+import { resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { isMultimodal } from "../lib/capability.ts";
-import { loadImage } from "../lib/image.ts";
+import { expandTilde, loadImage } from "../lib/image.ts";
 import { renderMarkers, buildHintLine, buildDescriptionsBlock } from "../lib/marker.ts";
 import { getSharedConfig, getSharedCache } from "../lib/state.ts";
 import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
@@ -66,12 +66,12 @@ export function findImagePathTokens(text: string): string[] {
 
 /** Resolve a token against cwd and return the absolute path if it's a real
  *  image file, else undefined. Unescapes \ (escaped spaces from terminal
- *  drag-and-drop) before resolving. */
-function resolveImageFile(token: string, cwd: string): string | undefined {
-  // Unescape \ → space (terminal drag-paste escaping)
-  const unescaped = token.replace(/\\ /g, " ");
-  const expanded = unescaped.startsWith("~/") ? resolvePath(cwd, unescaped) : unescaped;
-  const abs = isAbsolute(expanded) ? expanded : resolvePath(cwd, expanded);
+ *  drag-and-drop) and expands a leading ~/ before resolving. Exported so the
+ *  resolution rules are unit-testable without a pi runtime. */
+export function resolveImageFile(token: string, cwd: string): string | undefined {
+  // Unescape \ → space (terminal drag-paste escaping). `resolvePath` returns an
+  // already-absolute path unchanged, so no isAbsolute branch is needed.
+  const abs = resolvePath(cwd, expandTilde(token.replace(/\\ /g, " ")));
   if (!existsSync(abs)) return undefined;
   try {
     if (!statSync(abs).isFile()) return undefined;
@@ -250,9 +250,8 @@ async function updateComposePreview(ctx: ExtensionContext): Promise<void> {
   // Resolve + load each token (compress: false — show original quality)
   const previewImages: ReturnType<typeof makePreviewImage>[] = [];
   for (const token of tokens) {
-    const unescaped = token.replace(/\\ /g, " ");
-    const abs = isAbsolute(unescaped) ? unescaped : resolvePath(ctx.cwd, unescaped);
-    if (!existsSync(abs)) continue;
+    const abs = resolveImageFile(token, ctx.cwd);
+    if (!abs) continue;
     const result = await loadImage(abs, {
       compress: false,
       maxDimension: 1568,
@@ -361,9 +360,14 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
       return { action: "transform" as const, text };
     }
 
+    // Everything the model is shown from here on names `abs`, never the raw
+    // token: `~/x.png` or `./x.png` is not actionable without $HOME or the
+    // cwd, and the model would have to shell out to resolve it first.
+    const hintPaths = loaded.map((l) => l.abs);
+
     if (mode === "hint") {
       // Markers + hint line nudging the model to call describe_image.
-      text = `${text}\n${buildHintLine(loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i })))}`;
+      text = `${text}\n${buildHintLine(hintPaths)}`;
       return { action: "transform" as const, text };
     }
 
@@ -374,7 +378,6 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
     // failure (all-fail → hint; per-image fail → that image gets no description).
     const cache = getSharedCache();
     const visionModel = config.provider && config.model ? `${config.provider}/${config.model}` : "(unconfigured)";
-    const hintImages = loaded.map((l, i) => ({ token: l.token, index: resolved.get(l.token)?.index ?? i }));
 
     // ── Local-only short-circuit (SPEC-5 §3.2) ────────────────────────────
     // If local-only mode is on, every delegation would be refused (cache miss)
@@ -382,13 +385,13 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
     // waiting for refused calls to abort. Fall straight to hint so the model
     // can still call describe_image for cache hits (which local-only allows).
     if (config.localOnly) {
-      text = `${text}\n${buildHintLine(hintImages)}`;
+      text = `${text}\n${buildHintLine(hintPaths)}`;
       return { action: "transform" as const, text };
     }
 
     if (!cache || !config.provider || !config.model) {
       // Can't delegate (no cache or unconfigured) → fall back to hint.
-      text = `${text}\n${buildHintLine(hintImages)}`;
+      text = `${text}\n${buildHintLine(hintPaths)}`;
       return { action: "transform" as const, text };
     }
 
@@ -405,12 +408,12 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
       clearTimeout(timer);
     }
 
-    const descriptions: Array<{ token: string; index: number; text: string; cached: boolean }> = [];
+    const descriptions: Array<{ path: string; index: number; text: string; cached: boolean }> = [];
     let ok = 0;
     for (let i = 0; i < loaded.length; i++) {
       const r = results[i];
       if (r) {
-        descriptions.push({ token: loaded[i]!.token, index: resolved.get(loaded[i]!.token)?.index ?? i, text: r.text, cached: r.cached });
+        descriptions.push({ path: loaded[i]!.abs, index: resolved.get(loaded[i]!.token)?.index ?? i, text: r.text, cached: r.cached });
         ok++;
       }
       // undefined → that image gets no description (timeout/failure mid-batch)
@@ -418,7 +421,7 @@ export default function pasteExtension(_pi: ExtensionAPI): void {
 
     if (ok === 0) {
       // All failed/timed out → hint fallback (with paths, §3.4).
-      text = `${text}\n${buildHintLine(hintImages)}`;
+      text = `${text}\n${buildHintLine(hintPaths)}`;
       return { action: "transform" as const, text };
     }
 

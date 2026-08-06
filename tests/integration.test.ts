@@ -877,6 +877,45 @@ test("T32: text-only + auto → delegate per image + descriptions appended, no a
   }
 });
 
+// ── T32b: the descriptions block names the RESOLVED path too ───────────
+// Same reason as the hint line (T52b): the path in `[[Image-#1] <path>]:` is
+// the model's handle for a follow-up describe_image call on that image, so a
+// raw `~/…` token there is just as unusable.
+test("T32b: text-only + auto + ~/ token → descriptions block lists the resolved absolute path", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const home = mkdtempSync(join(tmpdir(), "vision-eval-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "vision-eval-cwd-"));
+  const origHome = process.env.HOME;
+  const file = join(home, "shot.png");
+  writeFileSync(file, make1x1Png(255, 0, 255));
+  const fm = mockFetch({ choices: [{ message: { content: "A magenta square." } }] });
+  try {
+    process.env.HOME = home;
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd }));
+    await runVisionCommand(pi, "provider ollama", TEXT_ONLY);
+    await runVisionCommand(pi, "model minimax-m3:cloud", TEXT_ONLY);
+    await runVisionCommand(pi, "paste-mode auto", TEXT_ONLY);
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: "analyze ~/shot.png", source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd, registry: makeRegistry({ model: VISION_MODEL }) }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    assert.match(inputResult.text, /magenta square/, "description appended");
+    // ★ GATE: the labeled line names the resolved path, not the typed token.
+    assert.ok(inputResult.text.includes(`${file}]:`), "★ descriptions block lists the resolved absolute path");
+    assert.ok(!inputResult.text.includes("~/shot.png"), "★ raw tilde token absent from the transformed text");
+  } finally {
+    fm.restore();
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 // ── T33: text-only + off → markers only, no hint, no delegation ──
 test("T33: text-only + off → markers only, no hint, no delegation", async () => {
   const pi = createMockPi();
@@ -1540,6 +1579,45 @@ test("T52: text-only + hint + 2 paths → markers + hint lists paths + batch aff
     assert.ok(inputResult.text.includes(`  ${fileB}`), "★ hint lists path B");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T52b: the hint lists RESOLVED paths, never the raw token ───────────
+// A `~/x.png` token is not actionable for the model without knowing $HOME —
+// observed in a real session, the model shelled out to `echo ~/x.png` just
+// to resolve the tilde before it could call describe_image. Guards the
+// paste.ts side of that fix (buildHintLine itself only sees paths now).
+test("T52b: text-only + hint + ~/ token → hint lists the resolved absolute path", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const home = mkdtempSync(join(tmpdir(), "vision-eval-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "vision-eval-cwd-"));
+  const origHome = process.env.HOME;
+  const file = join(home, "shot.png");
+  writeFileSync(file, make1x1Png(0, 0, 255));
+  try {
+    process.env.HOME = home;
+    writeFileSync(join(TMP_AGENT, "vision.json"), JSON.stringify({
+      provider: "ollama", model: "minimax-m3:cloud", enabled: true,
+      textOnlyPasteMode: "hint",
+    }));
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, makeCtx({ model: TEXT_ONLY, cwd }));
+    const inputResult = await pi.emit(
+      "input",
+      { type: "input", text: "analyze ~/shot.png", source: "interactive", images: [] },
+      makeCtx({ model: TEXT_ONLY, cwd }),
+    );
+    assert.equal(inputResult?.action, "transform");
+    // ★ GATE: the resolved path is listed; the raw tilde token never reaches
+    // the model — neither in the body (markered) nor in the hint.
+    assert.ok(inputResult.text.includes(`  ${file}`), "★ hint lists the resolved absolute path");
+    assert.ok(!inputResult.text.includes("~/shot.png"), "★ raw tilde token absent from the transformed text");
+  } finally {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 
