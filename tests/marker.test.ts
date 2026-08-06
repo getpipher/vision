@@ -160,7 +160,7 @@ test("renderMarkers: empty text", () => {
 // ── buildHintLine (v0.4.0: lists paths + names batch affordance) ───────────
 
 test("buildHintLine: single image → singular noun, one path, no batch clause", () => {
-  const line = buildHintLine([{ token: "/tmp/a.png", index: 0 }]);
+  const line = buildHintLine(["/tmp/a.png"]);
   assert.ok(line.startsWith("1 image referenced."), "singular noun");
   assert.ok(line.includes("analyze it."), "singular verb");
   assert.ok(!line.includes("image_paths"), "no batch affordance for 1 image");
@@ -168,10 +168,7 @@ test("buildHintLine: single image → singular noun, one path, no batch clause",
 });
 
 test("buildHintLine: multiple images → plural noun, N paths, batch affordance", () => {
-  const line = buildHintLine([
-    { token: "/tmp/a.png", index: 0 },
-    { token: "/tmp/b.jpeg", index: 1 },
-  ]);
+  const line = buildHintLine(["/tmp/a.png", "/tmp/b.jpeg"]);
   assert.ok(line.startsWith("2 images referenced."), "plural noun");
   assert.ok(line.includes("analyze them"), "plural verb");
   assert.ok(line.includes("image_paths"), "names the batch affordance");
@@ -184,24 +181,11 @@ test("buildHintLine: zero images (defensive)", () => {
   assert.equal(line, "0 images referenced.");
 });
 
-test("buildHintLine: paths are extractable via regex", () => {
-  const line = buildHintLine([
-    { token: "/tmp/a.png", index: 0 },
-    { token: "/tmp/pi-clipboard-3f1c.png", index: 1 },
-  ]);
+test("buildHintLine: paths are extractable via regex, in the order given", () => {
+  // Spaces in a filename must not break the `^  (.+)$` extraction contract.
+  const line = buildHintLine(["/tmp/a.png", "/tmp/pi-clipboard-3f1c.png", "/tmp/My Shot.png"]);
   const paths = [...line.matchAll(/^  (.+)$/gm)].map((m) => m[1]);
-  assert.deepEqual(paths, ["/tmp/a.png", "/tmp/pi-clipboard-3f1c.png"]);
-});
-
-test("buildHintLine: preserves token order (index not used for ordering)", () => {
-  // The caller passes tokens in marker order; output lists them in that order.
-  const line = buildHintLine([
-    { token: "/tmp/first.png", index: 0 },
-    { token: "/tmp/second.png", index: 1 },
-  ]);
-  const firstIdx = line.indexOf("/tmp/first.png");
-  const secondIdx = line.indexOf("/tmp/second.png");
-  assert.ok(firstIdx < secondIdx && firstIdx > -1, "first before second");
+  assert.deepEqual(paths, ["/tmp/a.png", "/tmp/pi-clipboard-3f1c.png", "/tmp/My Shot.png"]);
 });
 
 // ── buildBatchToolResult (v0.4.0: structured per-image tool result) ───────
@@ -282,7 +266,7 @@ test("buildBatchToolResult: empty paths (defensive)", () => {
 
 test("buildDescriptionsBlock: single image", () => {
   const out = buildDescriptionsBlock(
-    [{ token: "/tmp/a.png", index: 0, text: "A red square.", cached: false }],
+    [{ path: "/tmp/a.png", index: 0, text: "A red square.", cached: false }],
     "ollama/minimax-m3:cloud",
   );
   assert.ok(out.startsWith("\n\n"));
@@ -294,8 +278,8 @@ test("buildDescriptionsBlock: single image", () => {
 test("buildDescriptionsBlock: multiple images", () => {
   const out = buildDescriptionsBlock(
     [
-      { token: "/tmp/a.png", index: 0, text: "A red square.", cached: false },
-      { token: "/tmp/b.jpeg", index: 1, text: "A blue circle.", cached: true },
+      { path: "/tmp/a.png", index: 0, text: "A red square.", cached: false },
+      { path: "/tmp/b.jpeg", index: 1, text: "A blue circle.", cached: true },
     ],
     "ollama/minimax-m3:cloud",
   );
@@ -306,7 +290,7 @@ test("buildDescriptionsBlock: multiple images", () => {
 
 test("buildDescriptionsBlock: cached tag appears only when cached", () => {
   const out = buildDescriptionsBlock(
-    [{ token: "/tmp/a.png", index: 0, text: "desc", cached: false }],
+    [{ path: "/tmp/a.png", index: 0, text: "desc", cached: false }],
     "m",
   );
   assert.ok(!out.includes("(cached)"));

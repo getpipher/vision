@@ -120,18 +120,20 @@ export function renderMarkers(
  * For N≥2 images, names the `image_paths` batch affordance so the model
  * learns the batch tool exists. Paths are listed on indented lines so they
  * are trivially extractable (regex `^  (.+)$`).
+ *
+ * `paths` must be RESOLVED absolute paths, in marker order — a raw user
+ * token (`~/x.png`, `./x.png`) is not actionable without $HOME or the cwd
+ * and defeats §3.4's purpose.
  */
-export function buildHintLine(
-  images: Array<{ token: string; index: number }>,
-): string {
-  const n = images.length;
+export function buildHintLine(paths: string[]): string {
+  const n = paths.length;
   if (n === 0) {
     return "0 images referenced.";
   }
   const noun = n === 1 ? "image" : "images";
   const verb = n === 1 ? "analyze it" : "analyze them";
   const clause = n >= 2 ? " (single, or pass all paths to image_paths for batch analysis)" : "";
-  const pathLines = images.map((img) => `  ${img.token}`).join("\n");
+  const pathLines = paths.map((p) => `  ${p}`).join("\n");
   return `${n} ${noun} referenced. The active model cannot process images natively — use the describe_image tool to ${verb}${clause}.
 Image paths:
 ${pathLines}`;
@@ -191,9 +193,13 @@ export function buildBatchToolResult(
  * Build the descriptions block appended in text-only + "auto" mode.
  * Each image's delegation result is appended as a labeled line. A footer
  * notes the vision model + how to switch to hint mode (cost awareness).
+ *
+ * `path` is the resolved absolute path, for the same reason as
+ * `buildHintLine`: it is the model's handle for a follow-up
+ * `describe_image` call on the same image.
  */
 export function buildDescriptionsBlock(
-  descriptions: Array<{ token: string; index: number; text: string; cached: boolean }>,
+  descriptions: Array<{ path: string; index: number; text: string; cached: boolean }>,
   visionModel: string,
 ): string {
   if (descriptions.length === 0) return "";
@@ -201,7 +207,7 @@ export function buildDescriptionsBlock(
   const lines = descriptions.map((d) => {
     const label = styleMarker(d.index + 1, "code");
     const cachedTag = d.cached ? " (cached)" : "";
-    return `[${label} ${d.token}]: ${d.text}${cachedTag}`;
+    return `[${label} ${d.path}]: ${d.text}${cachedTag}`;
   });
 
   const footer = `[${descriptions.length} image(s) auto-described via ${visionModel}. Set textOnlyPasteMode to "hint" to delegate on-demand instead.]`;

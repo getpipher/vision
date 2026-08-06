@@ -1,6 +1,33 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findImagePathTokens } from "../extensions/paste.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { findImagePathTokens, resolveImageFile } from "../extensions/paste.ts";
+
+// 1×1 transparent PNG (same fixture as tests/image.test.ts).
+const PNG_BYTES = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M8AAAMBEg1+mP0AAAAASUVORK5CYII=",
+  "base64",
+);
+
+function tmpDir(): string {
+  return mkdtempSync(join(tmpdir(), "vision-paste-"));
+}
+
+/** Run `fn` with $HOME pointed at a fresh temp dir, restoring it afterwards. */
+function withTempHome(fn: (home: string) => void): void {
+  const home = tmpDir();
+  const origHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    fn(home);
+  } finally {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+}
 
 test("findImagePathTokens: absolute path", () => {
   assert.deepEqual(findImagePathTokens("analyze /tmp/screenshot.png"), ["/tmp/screenshot.png"]);
@@ -73,4 +100,42 @@ test("findImagePathTokens: escaped + regular paths mixed", () => {
   assert.equal(out.length, 2);
   assert.equal(out[0], "/tmp/a.png");
   assert.equal(out[1], "/tmp/My\\ B.jpeg");
+});
+
+// ── resolveImageFile: tilde expansion (fix) ────────────────────────────────
+// Previously `~/x.png` was resolved as `<cwd>/~/x.png`, so a home-relative
+// path pasted into the editor never resolved: no [Image-#N] marker, no hint
+// line, no compose preview, no auto-delegation. It only appeared to work
+// because the LLM expanded the tilde itself before calling describe_image.
+
+test("resolveImageFile: ~/ resolves against $HOME, not cwd", () => {
+  withTempHome((home) => {
+    const file = join(home, "shot.png");
+    writeFileSync(file, PNG_BYTES);
+    assert.equal(resolveImageFile("~/shot.png", join(home, "unrelated")), file);
+  });
+});
+
+test("resolveImageFile: ~/ with escaped spaces (drag-paste of a home path)", () => {
+  withTempHome((home) => {
+    const file = join(home, "My Screenshot.png");
+    writeFileSync(file, PNG_BYTES);
+    assert.equal(resolveImageFile("~/My\\ Screenshot.png", "/tmp"), file);
+  });
+});
+
+test("resolveImageFile: absolute + relative paths still resolve", () => {
+  const dir = tmpDir();
+  try {
+    const file = join(dir, "a.png");
+    writeFileSync(file, PNG_BYTES);
+    assert.equal(resolveImageFile(file, "/tmp"), file);
+    assert.equal(resolveImageFile("./a.png", dir), file);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveImageFile: nonexistent path → undefined", () => {
+  assert.equal(resolveImageFile("/nope/definitely-missing.png", "/tmp"), undefined);
 });

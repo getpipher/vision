@@ -9,6 +9,7 @@
  */
 import { readFile, stat } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 import { createHash } from "node:crypto";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
@@ -109,6 +110,18 @@ function parseDataUrl(input: string): ImageLoadResult {
   return { ok: true, image: { data: payload, mimeType: mime }, sourceHash: hashBytes(bytes) };
 }
 
+/**
+ * Expand a leading `~/` (or a bare `~`) to the user's home directory.
+ *
+ * `~user/…` is deliberately NOT expanded: resolving another user's home needs
+ * a passwd lookup, and silently mapping it onto the current user's home would
+ * be wrong. Such a token falls through unchanged.
+ */
+export function expandTilde(input: string): string {
+  if (input !== "~" && !input.startsWith("~/")) return input;
+  return resolvePath(homedir(), input.slice(2));
+}
+
 /** Is `input` plausibly a file path we should try to read (vs raw base64)? */
 function looksLikeFilePath(input: string): boolean {
   if (input.startsWith("data:")) return false;
@@ -148,7 +161,7 @@ export async function loadImage(input: string, options: LoadOptions): Promise<Im
   }
 
   if (looksLikeFilePath(input)) {
-    const abs = resolvePath(options.cwd, input.replace(/^~/, ""));
+    const abs = resolvePath(options.cwd, expandTilde(input));
     if (!existsSync(abs)) {
       // A path-looking string that doesn't exist might still be raw base64
       // (rare). Fall through to base64 decode rather than hard-failing.
