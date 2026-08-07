@@ -20,6 +20,7 @@
  * (auto-detect only fires when both provider + model are unset).
  */
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { isUsableVisionModel } from "./supported.ts";
 
 export interface DetectedDefaults {
   provider: string | undefined;
@@ -46,7 +47,10 @@ export const PREFERRED_PRIMARY_PROVIDER = "Ollama";
  * Pure + deterministic (same input in any order → same output).
  */
 export function autoDetectDefaults(models: Model<Api>[]): DetectedDefaults {
-  const visionModels = models.filter((m) => m.input?.includes("image"));
+  // ADR-0001: only models the delegate path can actually run (supported API
+  // types). Unsupported types (e.g. anthropic-messages) are invisible here so
+  // auto-detect never picks a model that would fail on every call.
+  const visionModels = models.filter((m) => isUsableVisionModel(m));
   if (visionModels.length === 0) {
     return { provider: undefined, model: undefined };
   }

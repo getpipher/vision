@@ -25,6 +25,7 @@ import { loadImage, type LoadedImage } from "./image.ts";
 import { cacheKey, type VisionCache } from "./cache.ts";
 import { AbortError, classifyError, withRetry } from "./resilience.ts";
 import { appendAuditEntry, resolveAuditPath, truncateImagePathForLog, type AuditEntry } from "./audit.ts";
+import { SUPPORTED_VISION_APIS, isSupportedVisionApi } from "./supported.ts";
 
 export interface DelegateParams {
   image_path: string;
@@ -59,8 +60,8 @@ export interface DelegateFailure {
 
 export type DelegateResult = DelegateSuccess | DelegateFailure;
 
-/** Build provider-specific reasoning params for the request body, if any. */
-function buildReasoningParams(
+/** Build completions-API reasoning params (flat `reasoning_effort`), if any. */
+function buildCompletionsReasoningParams(
   visionModel: Model<Api>,
   level: ReasoningLevel,
 ): Record<string, unknown> | undefined {
@@ -68,13 +69,124 @@ function buildReasoningParams(
   return { reasoning_effort: level };
 }
 
+/** Build responses-API reasoning params (nested `reasoning: { effort }`), if any. */
+function buildResponsesReasoningParams(
+  visionModel: Model<Api>,
+  level: ReasoningLevel,
+): Record<string, unknown> | undefined {
+  if (!visionModel.reasoning || level === "off") return undefined;
+  return { reasoning: { effort: level } };
+}
+
+/** Error for a vision model whose declared API type we cannot delegate to. */
+function unsupportedApiError(api: string): Error {
+  return new Error(
+    `Vision model API type "${api}" is not supported. Supported: ${[...SUPPORTED_VISION_APIS].join(", ")}.`,
+  );
+}
+
+/** Build the shared headers (auth + provider headers) for a vision request. */
+function buildHeaders(
+  apiKey: string | undefined,
+  providerHeaders: Record<string, string> | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  if (providerHeaders) Object.assign(headers, providerHeaders);
+  return headers;
+}
+
+/** Extract the message content (text or reasoning) from a chat/completions response. */
+function extractCompletionsText(json: unknown): string | undefined {
+  const j = json as {
+    choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
+  };
+  const msg = j.choices?.[0]?.message;
+  return msg?.content || msg?.reasoning_content;
+}
+
+/** Extract the first `output_text` from a responses-API response. */
+function extractResponsesText(json: unknown): string | undefined {
+  const j = json as {
+    output?: Array<{
+      type?: string;
+      content?: Array<{ type?: string; text?: string }>;
+    }>;
+  };
+  for (const item of j.output ?? []) {
+    if (item.type !== "message") continue;
+    for (const part of item.content ?? []) {
+      if (part.type === "output_text" && typeof part.text === "string" && part.text.length > 0) {
+        return part.text;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** POST the image (data URL) + prompt to the model's responses-API endpoint. */
+async function callResponsesEndpoint(
+  visionModel: Model<Api>,
+  apiKey: string | undefined,
+  providerHeaders: Record<string, string> | undefined,
+  image: LoadedImage,
+  prompt: string,
+  signal: AbortSignal | undefined,
+  reasoning: ReasoningLevel,
+  systemPrompt?: string,
+): Promise<string> {
+  const baseUrl = visionModel.baseUrl.replace(/\/+$/, "");
+  const input: unknown[] = [];
+  if (systemPrompt && systemPrompt.length > 0) {
+    input.push({ role: "system", content: systemPrompt });
+  }
+  input.push({
+    role: "user",
+    content: [
+      {
+        type: "input_image",
+        image_url: `data:${image.mimeType};base64,${image.data}`,
+      },
+      { type: "input_text", text: prompt },
+    ],
+  });
+  const body: Record<string, unknown> = {
+    model: visionModel.id,
+    input,
+    // OpenAI Responses rejects max_output_tokens below 16.
+    max_output_tokens: 4096,
+    temperature: 0,
+  };
+  const reasoningParams = buildResponsesReasoningParams(visionModel, reasoning);
+  if (reasoningParams) Object.assign(body, reasoningParams);
+
+  const headers = buildHeaders(apiKey, providerHeaders);
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => "");
+    throw new Error(
+      `Vision model returned ${response.status}: ${errBody.slice(0, 500)}`,
+    );
+  }
+
+  const text = extractResponsesText(await response.json());
+  if (!text) {
+    throw new Error("Vision model returned no content in the response");
+  }
+  return text;
+}
+
 /**
- * Call the vision model's OpenAI-compat chat/completions endpoint with the
- * image as a data URL + the user's prompt (and an optional system prompt).
- * Returns the model's text response. Exported + fetch-based so tests can mock
- * `globalThis.fetch`.
+ * POST the image (data URL) + prompt to the model's OpenAI-compat
+ * chat/completions endpoint. Returns the model's text response.
  */
-export async function callVisionModel(
+async function callCompletionsEndpoint(
   visionModel: Model<Api>,
   apiKey: string | undefined,
   providerHeaders: Record<string, string> | undefined,
@@ -105,13 +217,10 @@ export async function callVisionModel(
     max_tokens: 4096,
     temperature: 0,
   };
-  const reasoningParams = buildReasoningParams(visionModel, reasoning);
+  const reasoningParams = buildCompletionsReasoningParams(visionModel, reasoning);
   if (reasoningParams) Object.assign(body, reasoningParams);
 
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  if (providerHeaders) Object.assign(headers, providerHeaders);
-
+  const headers = buildHeaders(apiKey, providerHeaders);
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -126,15 +235,40 @@ export async function callVisionModel(
     );
   }
 
-  const json = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
-  };
-  const msg = json.choices?.[0]?.message;
-  const text = msg?.content || msg?.reasoning_content;
+  const text = extractCompletionsText(await response.json());
   if (!text) {
     throw new Error("Vision model returned no content in the response");
   }
   return text;
+}
+
+/**
+ * Call the vision model's endpoint with the image as a data URL + the
+ * user's prompt (and an optional system prompt). Returns the model's text
+ * response. Exported + fetch-based so tests can mock `globalThis.fetch`.
+ *
+ * Dispatches the request/response shape on the model's declared API type
+ * (ADR-0001): each supported type gets a branch, unknown types throw and
+ * flow into the caller's fallback. Add a new API type here with an `else if`
+ * branch + a matching endpoint function.
+ */
+export async function callVisionModel(
+  visionModel: Model<Api>,
+  apiKey: string | undefined,
+  providerHeaders: Record<string, string> | undefined,
+  image: LoadedImage,
+  prompt: string,
+  signal: AbortSignal | undefined,
+  reasoning: ReasoningLevel,
+  systemPrompt?: string,
+): Promise<string> {
+  if (visionModel.api === "openai-completions") {
+    return callCompletionsEndpoint(visionModel, apiKey, providerHeaders, image, prompt, signal, reasoning, systemPrompt);
+  } else if (visionModel.api === "openai-responses") {
+    return callResponsesEndpoint(visionModel, apiKey, providerHeaders, image, prompt, signal, reasoning, systemPrompt);
+  } else {
+    throw unsupportedApiError(visionModel.api);
+  }
 }
 
 function formatImageError(error: { code: string; path?: string; message?: string }, inputPath: string): string {

@@ -93,12 +93,17 @@ function makeCtx(opts: {
   apiKey?: string;
   headers?: Record<string, string>;
   cwd?: string;
+  /** Per-model lookup override: `(provider, id) → model`. When provided, the
+   *  registry resolves each requested model individually (primary + fallback
+   *  can differ). Falls back to `opts.model` when the override returns undefined. */
+  findOverride?: (provider: string, id: string) => Model<Api> | undefined;
 }): ExtensionContext {
   const model = opts.model ?? makeVisionModel();
   return {
     cwd: opts.cwd ?? "/tmp",
     modelRegistry: {
-      find: () => opts.model === null ? undefined : model,
+      find: (provider: string, id: string) =>
+        opts.model === null ? undefined : opts.findOverride?.(provider, id) ?? model,
       getApiKeyAndHeaders: async () =>
         opts.authOk === false
           ? { ok: false, error: opts.authError ?? "no api key" }
@@ -256,6 +261,118 @@ test("callVisionModel: no content in response throws", async () => {
       ),
       /no content/,
     );
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: openai-responses → POST /responses with input[] body", async () => {
+  const m = mockFetch({
+    status: 200,
+    body: {
+      output: [
+        {
+          type: "message",
+          content: [{ type: "output_text", text: "a red square" }],
+        },
+      ],
+    },
+  });
+  try {
+    const text = await callVisionModel(
+      makeVisionModel({ api: "openai-responses", baseUrl: "https://api.example.com/v1" }),
+      "key-456",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "describe this",
+      undefined,
+      "off",
+      "You are a careful analyst.",
+    );
+    assert.equal(text, "a red square");
+    assert.equal(m.calls.length, 1);
+    assert.equal(m.calls[0]!.url, "https://api.example.com/v1/responses");
+    const init = m.calls[0]!.init;
+    assert.equal(init.method, "POST");
+    const headers = init.headers as Record<string, string>;
+    assert.equal(headers.Authorization, "Bearer key-456");
+    assert.equal(headers["Content-Type"], "application/json");
+    const body = JSON.parse(init.body as string);
+    assert.equal(body.model, "minimax-m3:cloud");
+    assert.equal(body.input.length, 2);
+    assert.equal(body.input[0].role, "system");
+    assert.equal(body.input[0].content, "You are a careful analyst.");
+    assert.equal(body.input[1].role, "user");
+    assert.equal(body.input[1].content[0].type, "input_image");
+    assert.ok(body.input[1].content[0].image_url.startsWith("data:image/png;base64,"));
+    assert.equal(body.input[1].content[1].type, "input_text");
+    assert.equal(body.input[1].content[1].text, "describe this");
+    assert.ok(body.max_output_tokens >= 16, "max_output_tokens must be >= 16");
+    assert.equal(body.temperature, 0);
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: openai-responses with reasoning → nested reasoning.effort", async () => {
+  const m = mockFetch({
+    status: 200,
+    body: { output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }] },
+  });
+  try {
+    await callVisionModel(
+      makeVisionModel({ api: "openai-responses", reasoning: true }),
+      "k",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "p",
+      undefined,
+      "high",
+    );
+    const body = JSON.parse(m.calls[0]!.init.body as string);
+    assert.deepEqual(body.reasoning, { effort: "high" });
+    assert.equal(body.reasoning_effort, undefined, "flat reasoning_effort must NOT be sent for responses");
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: openai-responses empty output → no content error", async () => {
+  const m = mockFetch({ status: 200, body: { output: [] } });
+  try {
+    await assert.rejects(
+      callVisionModel(
+        makeVisionModel({ api: "openai-responses" }),
+        "k",
+        undefined,
+        { data: PNG_1x1_B64, mimeType: "image/png" },
+        "p",
+        undefined,
+        "off",
+      ),
+      /no content/,
+    );
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: unsupported api type throws clear error (no fetch)", async () => {
+  const m = mockFetch({ status: 200, body: { choices: [{ message: { content: "x" } }] } });
+  try {
+    await assert.rejects(
+      callVisionModel(
+        makeVisionModel({ api: "anthropic-messages" }),
+        "k",
+        undefined,
+        { data: PNG_1x1_B64, mimeType: "image/png" },
+        "p",
+        undefined,
+        "off",
+      ),
+      /anthropic-messages.*not supported/,
+    );
+    assert.equal(m.calls.length, 0, "unsupported api type must not hit the network");
   } finally {
     m.restore();
   }
@@ -504,6 +621,43 @@ test("delegateToVisionModel: 4xx (client) → no retry → fallback fires", asyn
       assert.equal(r.text, "fb-desc");
     }
     assert.equal(m.calls.length, 2, "1 primary (no retry) + 1 fallback");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: unsupported primary api type → no retry → fallback fires", async () => {
+  const dir = tmpDir();
+  // Unsupported primary must throw synchronously in the call layer (no fetch),
+  // so the sequence only sees the fallback request.
+  const m = mockFetchSeq([
+    { status: 200, body: { choices: [{ message: { content: "fb-desc" } }] } }, // fallback
+  ]);
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({
+      cwd: dir,
+      // Primary resolves to an unsupported api type; fallback resolves to a
+      // supported completions model (ADR-0001: unsupported → fallback fires).
+      findOverride: (provider, id) =>
+        provider === "openrouter" && id === "qwen3.5:cloud"
+          ? makeVisionModel({ id: "qwen3.5:cloud", provider: "openrouter", api: "openai-completions" })
+          : makeVisionModel({ api: "anthropic-messages" }),
+    });
+    const cfg = {
+      ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud",
+      retryAttempts: 3, retryBackoffMs: 1,
+      fallbackProvider: "openrouter", fallbackModel: "qwen3.5:cloud",
+    };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.details.fallback, true);
+      assert.equal(r.text, "fb-desc");
+    }
+    assert.equal(m.calls.length, 1, "unsupported primary = 0 primary calls + 1 fallback");
   } finally {
     m.restore();
     rmSync(dir, { recursive: true, force: true });
