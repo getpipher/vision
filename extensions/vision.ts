@@ -51,6 +51,7 @@ import {
 } from "../lib/config.ts";
 import { delegateToVisionModel, type DelegateParams } from "../lib/delegate.ts";
 import { VisionCache } from "../lib/cache.ts";
+import { isUsableVisionModel } from "../lib/supported.ts";
 import { setSharedState } from "../lib/state.ts";
 import { createPreviewComponent, makePreviewImage, detectProtocol, formatImageMetadata } from "../lib/preview.ts";
 import { matchesKey } from "@earendil-works/pi-tui";
@@ -195,9 +196,11 @@ function applyAndSave(id: string, value: string, pi: ExtensionAPI, ctx: Extensio
   if (id === "cachePersist" || id === "cacheMaxEntries") rebuildCache();
 }
 
-/** Vision-capable authed models from the registry (input includes "image"). */
+/** Vision models the delegate path can actually run (ADR-0001): image
+ *  capable + a supported API type. Unsupported types (e.g. anthropic-messages)
+ *  stay hidden until implemented — see lib/supported.ts. */
 function visionCapableModels(ctx: ExtensionContext): Model<Api>[] {
-  return ctx.modelRegistry.getAvailable().filter((m) => m.input.includes("image"));
+  return ctx.modelRegistry.getAvailable().filter((m) => isUsableVisionModel(m));
 }
 
 /** Open pi's native select picker over vision-capable models. Sets provider +

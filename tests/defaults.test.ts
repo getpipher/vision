@@ -83,6 +83,41 @@ test("only one provider with vision → fallback undefined (no other provider)",
   assert.equal(result.model, "minimax-m3:cloud");
 });
 
+test("ADR-0001: vision models with unsupported api types are filtered out", () => {
+  // anthropic-messages models are vision-capable but not delegatable (yet).
+  // auto-detect must ignore them — picking one would fail on every call.
+  const anthropicVision = (p: string, id: string) =>
+    ({ ...vision(p, id), api: "anthropic-messages" as Api });
+  const result = autoDetectDefaults([
+    anthropicVision("Ollama", "minimax-m3:cloud"),
+    anthropicVision("Ollama", "qwen3.7-plus"),
+  ]);
+  assert.equal(result.provider, undefined, "unsupported api types must not be auto-picked");
+  assert.equal(result.model, undefined);
+});
+
+test("ADR-0001: unsupported api filtered → supported model from other provider wins", () => {
+  const anthropicVision = (p: string, id: string) =>
+    ({ ...vision(p, id), api: "anthropic-messages" as Api });
+  const result = autoDetectDefaults([
+    anthropicVision("Ollama", "minimax-m3:cloud"), // unsupported, would win sort otherwise
+    vision("OpenRouter", "gpt-4o"),
+  ]);
+  assert.equal(result.provider, "OpenRouter");
+  assert.equal(result.model, "gpt-4o", "unsupported Ollama skipped; supported model picked");
+});
+
+test("ADR-0001: openai-responses models are supported by auto-detect", () => {
+  const responsesVision = (p: string, id: string) =>
+    ({ ...vision(p, id), api: "openai-responses" as Api });
+  const result = autoDetectDefaults([
+    responsesVision("OpenRouter", "gpt-5.6-luna"),
+    responsesVision("OpenRouter", "grok-4.5"),
+  ]);
+  assert.equal(result.provider, "OpenRouter");
+  assert.equal(result.model, "gpt-5.6-luna", "sorted by id: gpt < grok");
+});
+
 test("three providers with vision → primary Ollama (v0.5.1: no auto-fallback)", () => {
   const result = autoDetectDefaults([
     vision("Ollama", "minimax-m3:cloud"),
