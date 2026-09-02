@@ -17,7 +17,7 @@
  * Clean-room: the OpenAI-compatible `/chat/completions` request shape with a
  * base64 data-URL image is standard API usage, not copied from pi-vision-tool.
  */
-import type { Model, Api } from "@earendil-works/pi-ai";
+import type { Model, Api, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isConfiguredForDelegation, loadConfig, type ReasoningLevel, type VisionConfig } from "./config.ts";
@@ -77,7 +77,7 @@ function buildReasoningParams(
 export async function callVisionModel(
   visionModel: Model<Api>,
   apiKey: string | undefined,
-  providerHeaders: Record<string, string> | undefined,
+  providerHeaders: ProviderHeaders | undefined,
   image: LoadedImage,
   prompt: string,
   signal: AbortSignal | undefined,
@@ -110,7 +110,13 @@ export async function callVisionModel(
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  if (providerHeaders) Object.assign(headers, providerHeaders);
+  // pi-ai 0.84 widened ProviderHeaders to Record<string, string | null> — null means
+  // "unset"; a null value must never reach fetch's HeadersInit (typed Record<string, string>).
+  if (providerHeaders) {
+    for (const [key, value] of Object.entries(providerHeaders)) {
+      if (value !== null) headers[key] = value;
+    }
+  }
 
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -375,7 +381,7 @@ async function callWithRetryAndFallback(
   signal: AbortSignal | undefined,
   primaryModel: Model<Api>,
   apiKey: string | undefined,
-  headers: Record<string, string> | undefined,
+  headers: ProviderHeaders | undefined,
   image: LoadedImage,
   modelId: string,
   baseDetails: Omit<DelegateSuccess["details"], "cached" | "fallback">,
