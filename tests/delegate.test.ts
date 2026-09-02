@@ -143,6 +143,32 @@ test("callVisionModel: sends chat/completions POST with image data URL + prompt"
   }
 });
 
+test("callVisionModel: null-valued provider headers are filtered before fetch (pi-ai 0.84 ProviderHeaders)", async () => {
+  const m = mockFetch({
+    status: 200,
+    body: { choices: [{ message: { content: "ok" } }] },
+  });
+  try {
+    await callVisionModel(
+      makeVisionModel(),
+      "key-123",
+      { "X-Real-Header": "alive", "X-Null-Header": null },
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "describe this",
+      undefined,
+      "off",
+    );
+    assert.equal(m.calls.length, 1);
+    const headers = m.calls[0]!.init.headers as Record<string, string>;
+    assert.equal(headers["X-Real-Header"], "alive");
+    assert.ok(!("X-Null-Header" in headers), "null-valued header must not reach fetch");
+    assert.equal(headers.Authorization, "Bearer key-123");
+    assert.equal(headers["Content-Type"], "application/json");
+  } finally {
+    m.restore();
+  }
+});
+
 test("callVisionModel: falls back to reasoning_content when content is empty", async () => {
   const m = mockFetch({
     status: 200,
