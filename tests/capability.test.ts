@@ -1,3 +1,4 @@
+import "./setup.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Api, Model } from "@earendil-works/pi-ai";

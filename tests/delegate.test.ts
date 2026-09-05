@@ -1,10 +1,12 @@
+import { isInsideRealPiDir, REAL_PI_DIR } from "./setup.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   callVisionModel,
   delegateToVisionModel,
@@ -646,8 +648,8 @@ test("delegateToVisionModel: abort → code 'aborted', 0 calls, no fallback", as
 });
 // ── v0.5.0 (SPEC-5) tests: audit log + local-only mode ───────────────────
 
-import { readFileSync, existsSync, mkdirSync } from "node:fs";
-import { countAuditLog, tailAuditLog, clearAuditLog } from "../lib/audit.ts";
+import { readFileSync, existsSync } from "node:fs";
+import { countAuditLog, clearAuditLog } from "../lib/audit.ts";
 
 /** Helper: a temp dir + an image file + a configured ctx + an audit log path. */
 function setupAuditTest() {
@@ -907,3 +909,41 @@ test("T47 regression: single-image success with audit on → v0.4.0 behavior pre
 });
 
 
+
+// ── Guard: the agent-dir redirect from tests/setup.ts must stay in place ───
+// Tests that leave auditLogPath unset resolve to getAgentDir(). Without the
+// redirect, every one of them appends a line to the developer's real
+// ~/.pi/agent/vision-audit.log — silently mixing fixture entries (fake
+// providers, images that never existed) into the log that answers "where did
+// my image bytes actually go?".
+test("agent dir is redirected away from the real ~/.pi/agent", () => {
+  const agentDir = getAgentDir();
+  assert.ok(
+    process.env.PI_CODING_AGENT_DIR,
+    `agent dir must follow the redirect — is ./setup.ts still the first import?`,
+  );
+  assert.ok(
+    !isInsideRealPiDir(agentDir),
+    `agent dir must not be inside ${REAL_PI_DIR}, got ${agentDir}`,
+  );
+});
+
+// The redirect only holds for a file that installs it, and `tsx --test <file>`
+// is the normal single-file loop — so a new test file that forgets the import
+// silently writes to the real log. Cheaper to catch here than in the log.
+test("every test file installs the agent-dir redirect first", () => {
+  const testsDir = dirname(fileURLToPath(import.meta.url));
+  const files = readdirSync(testsDir).filter((f) => f.endsWith(".test.ts"));
+  assert.ok(files.length > 1, "expected to find the test files");
+  for (const file of files) {
+    const source = readFileSync(join(testsDir, file), "utf8");
+    const firstImport = source
+      .split("\n")
+      .find((line) => /^import[\s{]/.test(line));
+    assert.match(
+      firstImport ?? "",
+      /^import (?:.+ from )?"\.\/setup\.ts";$/,
+      `${file} must import "./setup.ts" before anything else — otherwise it writes to the real ~/.pi/agent`,
+    );
+  }
+});

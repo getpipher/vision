@@ -1,3 +1,4 @@
+import "./setup.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { AbortError, classifyError, sleep, withRetry, type ErrorClass } from "../lib/resilience.ts";

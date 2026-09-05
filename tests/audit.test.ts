@@ -8,6 +8,7 @@
  * clear, tail (with corruption defense), count, + the concurrency guarantee
  * (parallel appends don't interleave or corrupt — T68).
  */
+import "./setup.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, statSync, chmodSync } from "node:fs";
