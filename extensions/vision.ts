@@ -58,6 +58,7 @@ import { loadImage } from "../lib/image.ts";
 import { mapWithConcurrency } from "../lib/batch.ts";
 import { buildBatchToolResult } from "../lib/marker.ts";
 import { autoDetectDefaults } from "../lib/defaults.ts";
+import { isSupportedVisionApi, unsupportedApiMessage } from "../lib/wire.ts";
 import { clearAuditLog, countAuditLog, resolveAuditPath, tailAuditLog } from "../lib/audit.ts";
 
 /** Current config. Loaded on session_start, mutated by /vision, saved to disk. */
@@ -185,6 +186,16 @@ function resync(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   syncToolAvailability(pi, ctx.model, { enabled: config.enabled });
 }
 
+/** Warn when the configured vision model is registered but uses an API the
+ *  vision call cannot speak (it would only fail later, on the first image). */
+function warnIfUnsupportedApi(ctx: ExtensionContext): void {
+  if (!config.provider || !config.model) return;
+  const model = ctx.modelRegistry.find(config.provider, config.model);
+  if (model && !isSupportedVisionApi(model.api)) {
+    ctx.ui.notify(unsupportedApiMessage(model), "warning");
+  }
+}
+
 /** Apply a setting edit, persist, re-sync visibility if needed, and rebuild
  *  the cache when cache-shape fields change. */
 function applyAndSave(id: string, value: string, pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
@@ -192,12 +203,16 @@ function applyAndSave(id: string, value: string, pi: ExtensionAPI, ctx: Extensio
   saveConfig(config, getAgentDir());
   setSharedState(config, cache);
   if (id === "enabled" || id === "model") resync(pi, ctx);
+  if (id === "model") warnIfUnsupportedApi(ctx);
   if (id === "cachePersist" || id === "cacheMaxEntries") rebuildCache();
 }
 
-/** Vision-capable authed models from the registry (input includes "image"). */
+/** Vision-capable authed models from the registry (input includes "image") on
+ *  an API the vision call can speak — others would 404 on the first image. */
 function visionCapableModels(ctx: ExtensionContext): Model<Api>[] {
-  return ctx.modelRegistry.getAvailable().filter((m) => m.input.includes("image"));
+  return ctx.modelRegistry
+    .getAvailable()
+    .filter((m) => m.input.includes("image") && isSupportedVisionApi(m.api));
 }
 
 /** Open pi's native select picker over vision-capable models. Sets provider +
@@ -853,6 +868,7 @@ export default function visionExtension(pi: ExtensionAPI): void {
           saveConfig(config, agentDir);
           resync(pi, ctx);
           ctx.ui.notify(`Vision model set to ${value}.`, "info");
+          warnIfUnsupportedApi(ctx);
           return;
         }
         case "max-dim": {

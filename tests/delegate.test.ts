@@ -906,4 +906,198 @@ test("T47 regression: single-image success with audit on → v0.4.0 behavior pre
   }
 });
 
+// ── api-aware dispatch (regression: google/anthropic models used to 404) ──
+
+test("callVisionModel: google-generative-ai → generateContent with x-goog-api-key + inlineData", async () => {
+  const m = mockFetch({ status: 200, body: { candidates: [{ content: { parts: [{ text: "a blue circle" }] } }] } });
+  try {
+    const text = await callVisionModel(
+      makeVisionModel({ api: "google-generative-ai" as Api, id: "gemini-x", baseUrl: "https://gw.test/v1beta" }),
+      "key-g",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "describe this",
+      undefined,
+      "off",
+    );
+    assert.equal(text, "a blue circle");
+    assert.equal(m.calls.length, 1);
+    assert.equal(m.calls[0]!.url, "https://gw.test/v1beta/models/gemini-x:generateContent");
+    const headers = m.calls[0]!.init.headers as Record<string, string>;
+    assert.equal(headers["x-goog-api-key"], "key-g");
+    assert.equal("Authorization" in headers, false);
+    const body = JSON.parse(m.calls[0]!.init.body as string);
+    assert.equal(body.contents[0].parts[0].inlineData.mimeType, "image/png");
+    assert.equal(body.contents[0].parts[0].inlineData.data, PNG_1x1_B64);
+    assert.equal(body.contents[0].parts[1].text, "describe this");
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: anthropic-messages → /v1/messages with x-api-key + base64 image block", async () => {
+  const m = mockFetch({ status: 200, body: { content: [{ type: "text", text: "a green square" }], stop_reason: "end_turn" } });
+  try {
+    const text = await callVisionModel(
+      makeVisionModel({ api: "anthropic-messages" as Api, id: "claude-x", baseUrl: "https://gw.test" }),
+      "key-a",
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "describe this",
+      undefined,
+      "off",
+    );
+    assert.equal(text, "a green square");
+    assert.equal(m.calls[0]!.url, "https://gw.test/v1/messages");
+    const headers = m.calls[0]!.init.headers as Record<string, string>;
+    assert.equal(headers["x-api-key"], "key-a");
+    assert.equal(headers["anthropic-version"], "2023-06-01");
+    const body = JSON.parse(m.calls[0]!.init.body as string);
+    assert.equal(body.messages[0].content[0].source.media_type, "image/png");
+    assert.equal(body.messages[0].content[1].text, "describe this");
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: unsupported api rejects before any network call", async () => {
+  const m = mockFetch({ status: 200, body: {} });
+  try {
+    await assert.rejects(
+      callVisionModel(
+        makeVisionModel({ api: "bedrock-converse-stream" as Api }),
+        "k",
+        undefined,
+        { data: PNG_1x1_B64, mimeType: "image/png" },
+        "p",
+        undefined,
+        "off",
+      ),
+      /"bedrock-converse-stream" API/,
+    );
+    assert.equal(m.calls.length, 0, "no request was sent");
+  } finally {
+    m.restore();
+  }
+});
+
+test("callVisionModel: empty response reports why (finish/block reason) and stays a no-content error", async () => {
+  const m = mockFetch({ status: 200, body: { promptFeedback: { blockReason: "SAFETY" } } });
+  try {
+    await assert.rejects(
+      callVisionModel(
+        makeVisionModel({ api: "google-generative-ai" as Api, baseUrl: "https://gw.test/v1beta" }),
+        "k",
+        undefined,
+        { data: PNG_1x1_B64, mimeType: "image/png" },
+        "p",
+        undefined,
+        "off",
+      ),
+      /returned no content in the response \(SAFETY\)/,
+    );
+  } finally {
+    m.restore();
+  }
+});
+
+test("delegateToVisionModel: google-generative-ai primary works end to end", async () => {
+  const dir = tmpDir();
+  const m = mockFetch({ status: 200, body: { candidates: [{ content: { parts: [{ text: "desc via gemini" }] } }] } });
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({
+      cwd: dir,
+      model: makeVisionModel({ api: "google-generative-ai" as Api, id: "gemini-x", baseUrl: "https://gw.test/v1beta" }),
+    });
+    const cfg = { ...DEFAULT_CONFIG, provider: "gw", model: "gemini-x" };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal(r.text, "desc via gemini");
+    assert.match(m.calls[0]!.url, /\/models\/gemini-x:generateContent$/);
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: openai-responses primary works end to end", async () => {
+  const dir = tmpDir();
+  const m = mockFetch({
+    status: 200,
+    body: { output: [{ type: "message", content: [{ type: "output_text", text: "desc via responses" }] }] },
+  });
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = makeCtx({
+      cwd: dir,
+      model: makeVisionModel({ api: "openai-responses" as Api, id: "gpt-x", baseUrl: "https://gw.test/v1" }),
+    });
+    const cfg = { ...DEFAULT_CONFIG, provider: "gw", model: "gpt-x" };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, true);
+    if (r.ok) assert.equal(r.text, "desc via responses");
+    assert.equal(m.calls[0]!.url, "https://gw.test/v1/responses");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: unsupported api → unsupported_api pre-flight (no image read, no network, not audited)", async () => {
+  const { dir, file, auditPath, cfg } = setupAuditTest();
+  const m = mockFetch({ status: 200, body: {} });
+  try {
+    const ctx = makeCtx({ cwd: dir, model: makeVisionModel({ api: "bedrock-converse-stream" as Api }) });
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, false);
+    if (!r.ok) {
+      assert.equal(r.error.code, "unsupported_api");
+      assert.match(r.error.message, /bedrock-converse-stream/);
+      assert.match(r.error.message, /google-generative-ai/);
+    }
+    assert.equal(m.calls.length, 0);
+    assert.equal(countAuditLog(auditPath), 0, "pre-flight errors are not routing events");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("delegateToVisionModel: fallback on an unsupported api → unsupported_api with primary-error traceability", async () => {
+  const dir = tmpDir();
+  const primary = makeVisionModel();
+  const fallback = makeVisionModel({ api: "bedrock-converse-stream" as Api, id: "fb-model", provider: "fb" });
+  const m = mockFetchSeq([{ status: 400, body: "bad request" }]);
+  try {
+    const file = join(dir, "pixel.png");
+    writeFileSync(file, PNG_BYTES);
+    const ctx = {
+      cwd: dir,
+      modelRegistry: {
+        find: (provider: string) => (provider === "ollama" ? primary : fallback),
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k" }),
+      } as unknown as ExtensionContext["modelRegistry"],
+    } as unknown as ExtensionContext;
+    const cfg = {
+      ...DEFAULT_CONFIG, provider: "ollama", model: "minimax-m3:cloud",
+      retryAttempts: 1, retryBackoffMs: 1,
+      fallbackProvider: "fb", fallbackModel: "fb-model",
+    };
+    const r = await delegateToVisionModel(ctx, cfg, { image_path: file, prompt: "p", compress: false, reasoning: "off" }, undefined);
+    assert.equal(r.ok, false);
+    if (!r.ok) {
+      assert.equal(r.error.code, "unsupported_api");
+      assert.equal(r.details?.fallbackModel, "fb/fb-model");
+      assert.match(r.details?.primaryError ?? "", /400/);
+    }
+    assert.equal(m.calls.length, 1, "only the primary hit the network");
+  } finally {
+    m.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 

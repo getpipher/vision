@@ -20,6 +20,7 @@
  * (auto-detect only fires when both provider + model are unset).
  */
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { isSupportedVisionApi } from "./wire.ts";
 
 export interface DetectedDefaults {
   provider: string | undefined;
@@ -36,7 +37,9 @@ export const PREFERRED_PRIMARY_PROVIDER = "Ollama";
  * via /vision fallback if they want frontier escalation).
  *
  * Algorithm:
- * 1. Filter to vision-capable models (`input` includes "image").
+ * 1. Filter to vision-capable models (`input` includes "image") whose `api` the
+ *    vision call can speak (`isSupportedVisionApi`) — otherwise the pick would
+ *    404 on the first describe_image.
  * 2. If none → undefined (no-op; the existing not-configured error guides
  *    the user).
  * 3. Primary: prefer the `Ollama` provider; among those, first by sorted
@@ -46,7 +49,7 @@ export const PREFERRED_PRIMARY_PROVIDER = "Ollama";
  * Pure + deterministic (same input in any order → same output).
  */
 export function autoDetectDefaults(models: Model<Api>[]): DetectedDefaults {
-  const visionModels = models.filter((m) => m.input?.includes("image"));
+  const visionModels = models.filter((m) => m.input?.includes("image") && isSupportedVisionApi(m.api));
   if (visionModels.length === 0) {
     return { provider: undefined, model: undefined };
   }

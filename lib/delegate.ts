@@ -14,14 +14,16 @@
  *    secondary vision model on failure.
  * 4. Abort-aware — `ctx.signal` stops retry + skips fallback.
  *
- * Clean-room: the OpenAI-compatible `/chat/completions` request shape with a
- * base64 data-URL image is standard API usage, not copied from pi-vision-tool.
+ * Request shapes (OpenAI chat/completions, Gemini generateContent, Anthropic
+ * messages) live in `lib/wire.ts`; the call dispatches on `model.api`. They use
+ * standard base64 image payloads, not copied from pi-vision-tool.
  */
 import type { Model, Api, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isConfiguredForDelegation, loadConfig, type ReasoningLevel, type VisionConfig } from "./config.ts";
 import { loadImage, type LoadedImage } from "./image.ts";
+import { buildVisionRequest, extractVisionText, isSupportedVisionApi, unsupportedApiMessage } from "./wire.ts";
 import { cacheKey, type VisionCache } from "./cache.ts";
 import { AbortError, classifyError, withRetry } from "./resilience.ts";
 import { appendAuditEntry, resolveAuditPath, truncateImagePathForLog, type AuditEntry } from "./audit.ts";
@@ -59,20 +61,11 @@ export interface DelegateFailure {
 
 export type DelegateResult = DelegateSuccess | DelegateFailure;
 
-/** Build provider-specific reasoning params for the request body, if any. */
-function buildReasoningParams(
-  visionModel: Model<Api>,
-  level: ReasoningLevel,
-): Record<string, unknown> | undefined {
-  if (!visionModel.reasoning || level === "off") return undefined;
-  return { reasoning_effort: level };
-}
-
 /**
- * Call the vision model's OpenAI-compat chat/completions endpoint with the
- * image as a data URL + the user's prompt (and an optional system prompt).
- * Returns the model's text response. Exported + fetch-based so tests can mock
- * `globalThis.fetch`.
+ * Call the vision model with the image as base64 + the user's prompt (and an
+ * optional system prompt), in the wire format of `visionModel.api` (see
+ * `lib/wire.ts`). Returns the model's text response. Exported + fetch-based so
+ * tests can mock `globalThis.fetch`.
  */
 export async function callVisionModel(
   visionModel: Model<Api>,
@@ -84,44 +77,20 @@ export async function callVisionModel(
   reasoning: ReasoningLevel,
   systemPrompt?: string,
 ): Promise<string> {
-  const baseUrl = visionModel.baseUrl.replace(/\/+$/, "");
-  const messages: unknown[] = [];
-  if (systemPrompt && systemPrompt.length > 0) {
-    messages.push({ role: "system", content: systemPrompt });
-  }
-  messages.push({
-    role: "user",
-    content: [
-      {
-        type: "image_url",
-        image_url: { url: `data:${image.mimeType};base64,${image.data}` },
-      },
-      { type: "text", text: prompt },
-    ],
+  const request = buildVisionRequest({
+    model: visionModel,
+    apiKey,
+    providerHeaders,
+    image,
+    prompt,
+    reasoning,
+    systemPrompt,
   });
-  const body: Record<string, unknown> = {
-    model: visionModel.id,
-    messages,
-    max_tokens: 4096,
-    temperature: 0,
-  };
-  const reasoningParams = buildReasoningParams(visionModel, reasoning);
-  if (reasoningParams) Object.assign(body, reasoningParams);
 
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  // pi-ai 0.84 widened ProviderHeaders to Record<string, string | null> — null means
-  // "unset"; a null value must never reach fetch's HeadersInit (typed Record<string, string>).
-  if (providerHeaders) {
-    for (const [key, value] of Object.entries(providerHeaders)) {
-      if (value !== null) headers[key] = value;
-    }
-  }
-
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetch(request.url, {
     method: "POST",
-    headers,
-    body: JSON.stringify(body),
+    headers: request.headers,
+    body: JSON.stringify(request.body),
     signal,
   });
 
@@ -132,13 +101,9 @@ export async function callVisionModel(
     );
   }
 
-  const json = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
-  };
-  const msg = json.choices?.[0]?.message;
-  const text = msg?.content || msg?.reasoning_content;
+  const { text, reason } = extractVisionText(visionModel.api, await response.json());
   if (!text) {
-    throw new Error("Vision model returned no content in the response");
+    throw new Error(`Vision model returned no content in the response${reason ? ` (${reason})` : ""}`);
   }
   return text;
 }
@@ -254,6 +219,12 @@ export async function delegateToVisionModel(
         ].join("\n"),
       },
     };
+  }
+
+  // Fail before reading the image or touching the network: a model on an API
+  // the call cannot speak would only come back as an opaque 404.
+  if (!isSupportedVisionApi(visionModel.api)) {
+    return { ok: false, error: { code: "unsupported_api", message: unsupportedApiMessage(visionModel) } };
   }
 
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(visionModel);
@@ -422,6 +393,13 @@ async function runFallback(
     return {
       ok: false,
       error: { code: "model_not_found", message: FALLBACK_MODEL_NOT_FOUND_MSG(config.fallbackProvider!, config.fallbackModel!) },
+      details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
+    };
+  }
+  if (!isSupportedVisionApi(fbModel.api)) {
+    return {
+      ok: false,
+      error: { code: "unsupported_api", message: unsupportedApiMessage(fbModel) },
       details: { primaryError: primaryErrorTag(primaryErr), fallbackModel: fallbackId },
     };
   }

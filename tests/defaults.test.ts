@@ -134,3 +134,33 @@ test("primary model without a provider field → handled (sort key empty string)
   assert.equal(result.provider, "");
   assert.equal(result.model, "lonely");
 });
+
+test("models on an api the vision call cannot speak are never picked (would 404)", () => {
+  const onApi = (api: string, p: string, id: string) =>
+    ({ ...vision(p, id), api: api as Api }) as Model<Api>;
+  // Both sort before "quantforge-openai" — either used to win and 404 on the first call.
+  const result = autoDetectDefaults([
+    onApi("bedrock-converse-stream", "aws-bedrock", "claude-x"),
+    onApi("google-vertex", "aws-vertex", "gem-x"),
+    onApi("openai-completions", "quantforge-openai", "gemini-x"),
+  ]);
+  assert.equal(result.provider, "quantforge-openai");
+  assert.equal(result.model, "gemini-x");
+});
+
+test("supported non-openai apis (google, anthropic) remain eligible", () => {
+  const google = { ...vision("g", "gem"), api: "google-generative-ai" as Api } as Model<Api>;
+  assert.deepEqual(autoDetectDefaults([google]), { provider: "g", model: "gem" });
+  const anthropic = { ...vision("a", "claude"), api: "anthropic-messages" as Api } as Model<Api>;
+  assert.deepEqual(autoDetectDefaults([anthropic]), { provider: "a", model: "claude" });
+});
+
+test("openai-responses models remain eligible", () => {
+  const responses = { ...vision("r", "gpt-x"), api: "openai-responses" as Api } as Model<Api>;
+  assert.deepEqual(autoDetectDefaults([responses]), { provider: "r", model: "gpt-x" });
+});
+
+test("only unsupported-api vision models → all undefined (no-op)", () => {
+  const unsupported = { ...vision("p", "m"), api: "bedrock-converse-stream" as Api } as Model<Api>;
+  assert.deepEqual(autoDetectDefaults([unsupported]), { provider: undefined, model: undefined });
+});

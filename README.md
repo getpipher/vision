@@ -93,6 +93,26 @@ model should have `"input": ["text", "image"]`. Other `/vision` subcommands:
 Config is stored at `~/.pi/agent/vision.json` (not `vision-tool.json`, so it
 doesn't collide with the community package during transition).
 
+### Supported provider APIs
+
+The vision call speaks the wire format of the model's `api` in `models.json`:
+
+| `api` | Request | Auth header |
+|---|---|---|
+| `openai-completions` | `POST {baseUrl}/chat/completions` (`image_url` data URL) | `Authorization: Bearer` |
+| `openai-responses` | `POST {baseUrl}/responses` (`input_image` part; system prompt as `instructions`) — `baseUrl` carries the version, e.g. `…/v1` | `Authorization: Bearer` |
+| `google-generative-ai` | `POST {baseUrl}/models/{id}:generateContent` (`inlineData`) — `baseUrl` already carries the version, e.g. `…/v1beta` | `x-goog-api-key` |
+| `anthropic-messages` | `POST {baseUrl}/v1/messages` (base64 `image` block) — `baseUrl` has no `/v1` | `x-api-key` + `anthropic-version` |
+
+`reasoning-effort` is forwarded as `reasoning_effort` (chat/completions), `reasoning.effort`
+(Responses), `thinkingConfig.thinkingLevel`
+(Gemini, honouring the model's `thinkingLevelMap`) or an extended-thinking budget (Anthropic).
+`off` sends nothing. `temperature` is never sent to Anthropic or Responses (newer Claude and reasoning models reject it).
+
+Any other `api` (e.g. `google-vertex`, `bedrock-converse-stream`) is rejected
+up front with an `unsupported_api` error naming the supported ones, instead of an opaque 404.
+`/vision model` only lists models on a supported API.
+
 ## Resilience (v0.2.0)
 
 DELEGATE mode (text-only primary) is resilient + cheap:
@@ -292,7 +312,8 @@ cache miss. Every local-only event is audited with `local_only: true`
 ### Workflow-fit defaults (auto-detect)
 
 On a fresh install (or after `/vision clear`), the extension auto-detects the
-vision model at session start from `~/.pi/agent/models.json` — aligned to the
+vision model (only models on a [supported API](#supported-provider-apis)) at
+session start from `~/.pi/agent/models.json` — aligned to the
 [AGENTS.md LLM-backend policy](https://github.com/earendil-works) of "Ollama
 Cloud primary + frontier escalation":
 
