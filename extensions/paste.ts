@@ -224,8 +224,10 @@ async function updateComposePreview(ctx: ExtensionContext): Promise<void> {
   if (ctx.mode !== "tui") return; // widget is TUI-only
 
   const editorText = ctx.ui.getEditorText();
-  // Don't show compose preview for slash commands — they have their own UI
-  if (editorText.trim().startsWith("/")) {
+  // Don't show compose preview for slash commands — they have their own UI.
+  // A POSIX absolute path also starts with "/"; only treat it as a command
+  // when the text contains no resolvable image path token.
+  if (editorText.trim().startsWith("/") && findImagePathTokens(editorText).length === 0) {
     if (lastPreviewTokens) {
       ctx.ui.setWidget("vision-compose-preview", undefined);
       lastPreviewTokens = "";

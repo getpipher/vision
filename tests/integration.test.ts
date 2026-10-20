@@ -1983,6 +1983,54 @@ test("T70: v0.5.0 regression gate — config fields + subcommands + auto-detect 
   assert.ok(true, "v0.5.0 surface wired + regression gate passed");
 });
 
+// ── T71: compose-time preview — absolute pasted path is NOT a slash command ──
+test("T71: compose-time preview — editor text that starts with an absolute image path still previews", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir, file } = tmpImgDir();
+  let widgetSet = false;
+  try {
+    // pi's clipboard paste inserts exactly the absolute path (starts with "/"),
+    // which must not be mistaken for a slash command.
+    const ctx = makeCtx({ model: MULTIMODAL, cwd: dir }) as any;
+    ctx.hasUI = true;
+    ctx.ui.setWidget = (key: string, content: any) => { if (content !== undefined) widgetSet = true; };
+    ctx.ui.getEditorText = () => file;
+    ctx.ui.onTerminalInput = (handler: any) => { (ctx as any)._inputHandler = handler; return () => {}; };
+
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+    if ((ctx as any)._inputHandler) (ctx as any)._inputHandler("a");
+    await new Promise((r) => setTimeout(r, 400));
+    assert.ok(widgetSet, "absolute path must render the compose preview");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── T72: compose-time preview — a real slash command stays skipped ──
+test("T72: compose-time preview — slash command without an image path does not preview", async () => {
+  const pi = createMockPi();
+  visionFactory(pi as unknown as ExtensionAPI);
+  pasteFactory(pi as unknown as ExtensionAPI);
+  const { dir } = tmpImgDir();
+  let widgetSet = false;
+  try {
+    const ctx = makeCtx({ model: MULTIMODAL, cwd: dir }) as any;
+    ctx.hasUI = true;
+    ctx.ui.setWidget = (key: string, content: any) => { if (content !== undefined) widgetSet = true; };
+    ctx.ui.getEditorText = () => "/vision";
+    ctx.ui.onTerminalInput = (handler: any) => { (ctx as any)._inputHandler = handler; return () => {}; };
+
+    await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+    if ((ctx as any)._inputHandler) (ctx as any)._inputHandler("a");
+    await new Promise((r) => setTimeout(r, 400));
+    assert.ok(!widgetSet, "slash commands keep their own UI");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // Cleanup the temp agent dir after all tests.
 test("cleanup", () => {
   rmSync(TMP_AGENT, { recursive: true, force: true });
