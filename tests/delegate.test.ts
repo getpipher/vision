@@ -143,6 +143,30 @@ test("callVisionModel: sends chat/completions POST with image data URL + prompt"
   }
 });
 
+test("callVisionModel: omits temperature when model.compat.supportsTemperature is false", async () => {
+  // Claude Haiku 5.5 (and other newer models) reject any temperature but the
+  // provider default; pi-ai marks them compat.supportsTemperature: false.
+  const m = mockFetch({
+    status: 200,
+    body: { choices: [{ message: { content: "ok" } }] },
+  });
+  try {
+    await callVisionModel(
+      makeVisionModel({ compat: { supportsTemperature: false } } as Partial<Model<Api>>),
+      undefined,
+      undefined,
+      { data: PNG_1x1_B64, mimeType: "image/png" },
+      "describe this",
+      undefined,
+      "off",
+    );
+    const body = JSON.parse(m.calls[0]!.init.body as string);
+    assert.equal("temperature" in body, false);
+  } finally {
+    m.restore();
+  }
+});
+
 test("callVisionModel: null-valued provider headers are filtered before fetch (pi-ai 0.84 ProviderHeaders)", async () => {
   const m = mockFetch({
     status: 200,

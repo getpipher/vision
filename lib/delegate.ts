@@ -103,8 +103,11 @@ export async function callVisionModel(
     model: visionModel.id,
     messages,
     max_tokens: 4096,
-    temperature: 0,
   };
+  // Some models (e.g. Claude Haiku 5.5) reject an explicit temperature; pi-ai
+  // marks them compat.supportsTemperature: false. Default true, as pi-ai does.
+  const compat = (visionModel as { compat?: { supportsTemperature?: boolean } }).compat;
+  if (compat?.supportsTemperature ?? true) body.temperature = 0;
   const reasoningParams = buildReasoningParams(visionModel, reasoning);
   if (reasoningParams) Object.assign(body, reasoningParams);
 
